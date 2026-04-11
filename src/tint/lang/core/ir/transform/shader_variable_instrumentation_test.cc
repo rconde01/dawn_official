@@ -254,7 +254,7 @@ TEST_F(IR_ShaderVariableInstrumentationTest,
 
     auto* expect = R"(
 tint_shader_debug_buffer = struct @align(4) {
-  cursor:atomic<u32> @offset(0)
+  cursor:u32 @offset(0)
   records:array<u32> @offset(4)
 }
 
@@ -279,14 +279,16 @@ $B1: {  # root
     if %13 [t: $B3] {  # if_1
       $B3: {  # true
         %14:u32 = load %v
-        %15:ptr<storage, atomic<u32>, read_write> = access %tint_shader_debug_buffer, 0u
-        %16:u32 = atomicAdd %15, 1u
-        %17:u32 = mul %16, 2u
-        %18:u32 = add %17, 1u
-        %19:ptr<storage, u32, read_write> = access %tint_shader_debug_buffer, 1u, %17
-        store %19, 0u
+        %15:ptr<storage, u32, read_write> = access %tint_shader_debug_buffer, 0u
+        %16:u32 = load %15
+        %17:u32 = add %16, 1u
+        store %15, %17
+        %18:u32 = mul %16, 2u
+        %19:u32 = add %18, 1u
         %20:ptr<storage, u32, read_write> = access %tint_shader_debug_buffer, 1u, %18
-        store %20, %14
+        store %20, 0u
+        %21:ptr<storage, u32, read_write> = access %tint_shader_debug_buffer, 1u, %19
+        store %21, %14
         exit_if  # if_1
       }
     }

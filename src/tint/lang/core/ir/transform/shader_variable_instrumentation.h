@@ -72,8 +72,11 @@ enum class ShaderVariableInstrumentationScalarType : uint32_t {
 /// buffer has the following logical layout:
 ///
 ///     struct TintDebugBuffer {
-///       // An atomic cursor incremented each time a store is observed.
-///       cursor : atomic<u32>,
+///       // Cursor incremented each time a store is observed. The field is
+///       // `atomic<u32>` by default. When `target_fragment_coord` is set,
+///       // only one invocation passes the gate, so the cursor is emitted as
+///       // a plain `u32` and incremented with a non-atomic load/add/store.
+///       cursor : atomic<u32>,  // or u32 (see above)
 ///       // A flat array of u32 records. Each record is 2 u32s:
 ///       //   records[slot * 2 + 0] : the store id assigned by the transform
 ///       //   records[slot * 2 + 1] : the stored value, bitcast to u32
@@ -113,6 +116,20 @@ struct ShaderVariableInstrumentationConfig {
     /// and is therefore also `false` for vertex and compute invocations that
     /// happen to share the module. As a result, when this option is set only
     /// the targeted fragment invocation produces any debug records.
+    ///
+    /// Caveats — when this option is set, the transform also drops the
+    /// `atomic<u32>` cursor in favour of a plain `u32`. That is sound under
+    /// the assumption that *exactly one* fragment invocation matches the
+    /// target coordinate. The cases where that assumption can break:
+    ///   * MSAA render targets — multiple sample invocations of the same
+    ///     pixel will all pass the gate. Filter additionally on
+    ///     `@builtin(sample_index)` from the host side, or render to a
+    ///     non-MSAA target when debugging.
+    ///   * Multiple draw calls that hit the same pixel between buffer reads.
+    ///     The non-atomic increment is still well-defined when invocations
+    ///     are serialised by ROP, but if you draw twice without resetting the
+    ///     cursor in between, the second draw's records will append after
+    ///     the first.
     std::optional<std::array<uint32_t, 2>> target_fragment_coord{};
 };
 

@@ -256,19 +256,29 @@ struct State {
         }
     }
 
+    /// @returns true if the cursor field should be `atomic<u32>`. The cursor
+    /// only needs to be atomic when more than one invocation might race on
+    /// the increment. When `target_fragment_coord` is set, only the
+    /// invocation whose `(u32(pos.x), u32(pos.y))` matches passes the gate,
+    /// so the cursor can be a plain `u32`.
+    bool UseAtomicCursor() const { return !config.target_fragment_coord.has_value(); }
+
     /// Create (once) the debug storage buffer variable and its struct type.
     void EnsureDebugBuffer() {
         if (debug_buffer_var != nullptr) {
             return;
         }
-        // struct TintDebugBuffer {
-        //   cursor : atomic<u32>,
+        // struct tint_shader_debug_buffer {
+        //   cursor  : atomic<u32> | u32,   // atomic only if no fragment filter
         //   records : array<u32>,
         // }
+        const core::type::Type* cursor_ty =
+            UseAtomicCursor() ? static_cast<const core::type::Type*>(ty.atomic<u32>())
+                              : static_cast<const core::type::Type*>(ty.u32());
         debug_buffer_struct =
             ty.Struct(ir.symbols.New("tint_shader_debug_buffer"),
                       {
-                          {ir.symbols.Register("cursor"), ty.atomic<u32>()},
+                          {ir.symbols.Register("cursor"), cursor_ty},
                           {ir.symbols.Register("records"), ty.array<u32>()},
                       });
 
@@ -302,11 +312,26 @@ struct State {
             bits = b.Bitcast(ty.u32(), loaded)->Result();
         }
 
-        // slot = atomicAdd(&buffer.cursor, 1u)
-        auto* cursor_ptr = b.Access(
-            ty.ptr(core::AddressSpace::kStorage, ty.atomic<u32>(), core::Access::kReadWrite),
-            debug_buffer_var, u32(kCursorMemberIndex));
-        auto* slot = b.Call(ty.u32(), core::BuiltinFn::kAtomicAdd, cursor_ptr, 1_u)->Result();
+        // Reserve a slot in the records array.
+        Value* slot = nullptr;
+        if (UseAtomicCursor()) {
+            // slot = atomicAdd(&buffer.cursor, 1u)
+            auto* cursor_ptr = b.Access(
+                ty.ptr(core::AddressSpace::kStorage, ty.atomic<u32>(), core::Access::kReadWrite),
+                debug_buffer_var, u32(kCursorMemberIndex));
+            slot = b.Call(ty.u32(), core::BuiltinFn::kAtomicAdd, cursor_ptr, 1_u)->Result();
+        } else {
+            // The fragment-coord gate guarantees a single invocation reaches
+            // here, so we can use a plain load/add/store on a non-atomic u32:
+            //   slot = buffer.cursor;
+            //   buffer.cursor = slot + 1u;
+            auto* cursor_ptr = b.Access(
+                ty.ptr(core::AddressSpace::kStorage, ty.u32(), core::Access::kReadWrite),
+                debug_buffer_var, u32(kCursorMemberIndex));
+            slot = b.Load(cursor_ptr)->Result();
+            auto* next = b.Add(slot, 1_u)->Result();
+            b.Store(cursor_ptr, next);
+        }
 
         // idx = slot * 2u
         auto* idx = b.Multiply(slot, 2_u)->Result();
