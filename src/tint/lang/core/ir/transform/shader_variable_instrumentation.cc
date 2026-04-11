@@ -287,8 +287,20 @@ struct State {
     /// @param store the store being instrumented
     /// @param id the assigned record id
     void EmitAppendRecord(Store* store, uint32_t id) {
-        const auto* from_type = store->From()->Type();
-        auto* stored_value = store->From();
+        const auto* val_type = store->From()->Type();
+
+        // Read the value back from the destination pointer so the captured
+        // record reflects what is actually in memory after the user store,
+        // rather than the source expression of the store. This guarantees the
+        // debugger sees the same bits the rest of the shader will read, even
+        // if a later transform rewrites or DCEs the source expression.
+        auto* loaded = b.Load(store->To())->Result();
+        Value* bits = nullptr;
+        if (val_type->Is<core::type::U32>()) {
+            bits = loaded;
+        } else {
+            bits = b.Bitcast(ty.u32(), loaded)->Result();
+        }
 
         // slot = atomicAdd(&buffer.cursor, 1u)
         auto* cursor_ptr = b.Access(
@@ -307,13 +319,7 @@ struct State {
             debug_buffer_var, u32(kRecordsMemberIndex), idx);
         b.Store(id_ptr, u32(id));
 
-        // records[idx + 1] = bitcast<u32>(stored_value)
-        Value* bits = nullptr;
-        if (from_type->Is<core::type::U32>()) {
-            bits = stored_value;
-        } else {
-            bits = b.Bitcast(ty.u32(), stored_value)->Result();
-        }
+        // records[idx + 1] = bits
         auto* value_ptr = b.Access(
             ty.ptr(core::AddressSpace::kStorage, ty.u32(), core::Access::kReadWrite),
             debug_buffer_var, u32(kRecordsMemberIndex), idx_plus_one);

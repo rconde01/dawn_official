@@ -151,14 +151,15 @@ $B1: {  # root
   $B2: {
     %v:ptr<function, u32, read_write> = var undef
     store %v, 42u
-    %4:ptr<storage, atomic<u32>, read_write> = access %tint_shader_debug_buffer, 0u
-    %5:u32 = atomicAdd %4, 1u
-    %6:u32 = mul %5, 2u
-    %7:u32 = add %6, 1u
-    %8:ptr<storage, u32, read_write> = access %tint_shader_debug_buffer, 1u, %6
-    store %8, 0u
+    %4:u32 = load %v
+    %5:ptr<storage, atomic<u32>, read_write> = access %tint_shader_debug_buffer, 0u
+    %6:u32 = atomicAdd %5, 1u
+    %7:u32 = mul %6, 2u
+    %8:u32 = add %7, 1u
     %9:ptr<storage, u32, read_write> = access %tint_shader_debug_buffer, 1u, %7
-    store %9, 42u
+    store %9, 0u
+    %10:ptr<storage, u32, read_write> = access %tint_shader_debug_buffer, 1u, %8
+    store %10, %4
     ret
   }
 }
@@ -197,15 +198,16 @@ $B1: {  # root
   $B2: {
     %v:ptr<function, i32, read_write> = var undef
     store %v, -7i
-    %4:ptr<storage, atomic<u32>, read_write> = access %tint_shader_debug_buffer, 0u
-    %5:u32 = atomicAdd %4, 1u
-    %6:u32 = mul %5, 2u
-    %7:u32 = add %6, 1u
-    %8:ptr<storage, u32, read_write> = access %tint_shader_debug_buffer, 1u, %6
-    store %8, 0u
-    %9:u32 = bitcast<u32> -7i
-    %10:ptr<storage, u32, read_write> = access %tint_shader_debug_buffer, 1u, %7
-    store %10, %9
+    %4:i32 = load %v
+    %5:u32 = bitcast<u32> %4
+    %6:ptr<storage, atomic<u32>, read_write> = access %tint_shader_debug_buffer, 0u
+    %7:u32 = atomicAdd %6, 1u
+    %8:u32 = mul %7, 2u
+    %9:u32 = add %8, 1u
+    %10:ptr<storage, u32, read_write> = access %tint_shader_debug_buffer, 1u, %8
+    store %10, 0u
+    %11:ptr<storage, u32, read_write> = access %tint_shader_debug_buffer, 1u, %9
+    store %11, %5
     ret
   }
 }
@@ -276,14 +278,15 @@ $B1: {  # root
     %13:bool = load %tint_shader_debug_match
     if %13 [t: $B3] {  # if_1
       $B3: {  # true
-        %14:ptr<storage, atomic<u32>, read_write> = access %tint_shader_debug_buffer, 0u
-        %15:u32 = atomicAdd %14, 1u
-        %16:u32 = mul %15, 2u
-        %17:u32 = add %16, 1u
-        %18:ptr<storage, u32, read_write> = access %tint_shader_debug_buffer, 1u, %16
-        store %18, 0u
+        %14:u32 = load %v
+        %15:ptr<storage, atomic<u32>, read_write> = access %tint_shader_debug_buffer, 0u
+        %16:u32 = atomicAdd %15, 1u
+        %17:u32 = mul %16, 2u
+        %18:u32 = add %17, 1u
         %19:ptr<storage, u32, read_write> = access %tint_shader_debug_buffer, 1u, %17
-        store %19, 42u
+        store %19, 0u
+        %20:ptr<storage, u32, read_write> = access %tint_shader_debug_buffer, 1u, %18
+        store %20, %14
         exit_if  # if_1
       }
     }
