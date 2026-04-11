@@ -28,7 +28,9 @@
 #ifndef SRC_TINT_LANG_CORE_IR_TRANSFORM_SHADER_VARIABLE_INSTRUMENTATION_H_
 #define SRC_TINT_LANG_CORE_IR_TRANSFORM_SHADER_VARIABLE_INSTRUMENTATION_H_
 
+#include <array>
 #include <cstdint>
+#include <optional>
 #include <string>
 #include <unordered_set>
 #include <vector>
@@ -92,6 +94,26 @@ struct ShaderVariableInstrumentationConfig {
     /// instrumenting stores that target resource bindings that the caller
     /// wants to leave untouched.
     std::unordered_set<tint::BindingPoint> skip_bindings{};
+
+    /// If set, only captures stores executed by the fragment invocation whose
+    /// `@builtin(position).xy` (truncated to `u32`) matches `{x, y}`.
+    ///
+    /// When enabled, the transform:
+    ///   * adds a `var<private> tint_shader_debug_match : bool = false`
+    ///     flag to the module,
+    ///   * for every fragment entry point, ensures the entry point has a
+    ///     `@builtin(position) : vec4<f32>` parameter (adding one if it
+    ///     doesn't already have one) and emits code at the top of the
+    ///     entry-point body that assigns
+    ///     `tint_shader_debug_match = (u32(pos.x) == x) & (u32(pos.y) == y)`,
+    ///   * wraps every instrumented store's append sequence in
+    ///     `if (tint_shader_debug_match) { ... }`.
+    ///
+    /// The flag lives in the `private` address space, so it is per-invocation
+    /// and is therefore also `false` for vertex and compute invocations that
+    /// happen to share the module. As a result, when this option is set only
+    /// the targeted fragment invocation produces any debug records.
+    std::optional<std::array<uint32_t, 2>> target_fragment_coord{};
 };
 
 /// Information about a single instrumented store.

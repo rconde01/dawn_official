@@ -233,6 +233,129 @@ TEST_F(IR_ShaderVariableInstrumentationTest, VectorStore_NotInstrumented) {
     EXPECT_EQ(result.records.size(), 0u);
 }
 
+TEST_F(IR_ShaderVariableInstrumentationTest,
+       FragmentCoordFilter_AddsPositionParamAndGate) {
+    auto* ep = b.Function("frag", ty.vec4<f32>(), Function::PipelineStage::kFragment);
+    ep->SetReturnLocation(0_u);
+    b.Append(ep->Block(), [&] {
+        auto* v = b.Var<function, u32>("v");
+        b.Store(v, 42_u);
+        b.Return(ep, b.Splat(ty.vec4<f32>(), 0_f));
+    });
+
+    ShaderVariableInstrumentationConfig cfg;
+    cfg.buffer_binding_point = {1, 0};
+    cfg.target_fragment_coord = std::array<uint32_t, 2>{100u, 50u};
+    auto result = RunAndValidate(cfg);
+
+    ASSERT_EQ(result.records.size(), 1u);
+
+    auto* expect = R"(
+tint_shader_debug_buffer = struct @align(4) {
+  cursor:atomic<u32> @offset(0)
+  records:array<u32> @offset(4)
+}
+
+$B1: {  # root
+  %tint_shader_debug_buffer:ptr<storage, tint_shader_debug_buffer, read_write> = var undef @binding_point(1, 0)
+  %tint_shader_debug_match:ptr<private, bool, read_write> = var false
+}
+
+%frag = @fragment func(%tint_frag_coord:vec4<f32> [@position]):vec4<f32> [@location(0)] {
+  $B2: {
+    %5:f32 = access %tint_frag_coord, 0u
+    %6:f32 = access %tint_frag_coord, 1u
+    %7:u32 = convert %5
+    %8:u32 = convert %6
+    %9:bool = eq %7, 100u
+    %10:bool = eq %8, 50u
+    %11:bool = and %9, %10
+    store %tint_shader_debug_match, %11
+    %v:ptr<function, u32, read_write> = var undef
+    store %v, 42u
+    %13:bool = load %tint_shader_debug_match
+    if %13 [t: $B3] {  # if_1
+      $B3: {  # true
+        %14:ptr<storage, atomic<u32>, read_write> = access %tint_shader_debug_buffer, 0u
+        %15:u32 = atomicAdd %14, 1u
+        %16:u32 = mul %15, 2u
+        %17:u32 = add %16, 1u
+        %18:ptr<storage, u32, read_write> = access %tint_shader_debug_buffer, 1u, %16
+        store %18, 0u
+        %19:ptr<storage, u32, read_write> = access %tint_shader_debug_buffer, 1u, %17
+        store %19, 42u
+        exit_if  # if_1
+      }
+    }
+    ret vec4<f32>(0.0f)
+  }
+}
+)";
+    EXPECT_EQ(expect, str());
+}
+
+TEST_F(IR_ShaderVariableInstrumentationTest,
+       FragmentCoordFilter_ReusesExistingPositionParam) {
+    auto* pos = b.FunctionParam("my_pos", ty.vec4<f32>());
+    pos->SetBuiltin(core::BuiltinValue::kPosition);
+    auto* ep = b.Function("frag", ty.vec4<f32>(), Function::PipelineStage::kFragment);
+    ep->SetParams({pos});
+    ep->SetReturnLocation(0_u);
+    b.Append(ep->Block(), [&] {
+        auto* v = b.Var<function, u32>("v");
+        b.Store(v, 42_u);
+        b.Return(ep, b.Splat(ty.vec4<f32>(), 0_f));
+    });
+
+    ShaderVariableInstrumentationConfig cfg;
+    cfg.buffer_binding_point = {1, 0};
+    cfg.target_fragment_coord = std::array<uint32_t, 2>{0u, 0u};
+    auto result = RunAndValidate(cfg);
+
+    ASSERT_EQ(result.records.size(), 1u);
+
+    // The existing `my_pos` parameter should be reused; no new parameter is
+    // appended.
+    EXPECT_EQ(ep->Params().Length(), 1u);
+
+    // The entry point body now opens with the match computation using the
+    // existing parameter.
+    auto ir_text = str();
+    EXPECT_NE(ir_text.find("%my_pos"), std::string::npos);
+    EXPECT_EQ(ir_text.find("tint_frag_coord"), std::string::npos);
+    EXPECT_NE(ir_text.find("store %tint_shader_debug_match"), std::string::npos);
+    EXPECT_NE(ir_text.find("load %tint_shader_debug_match"), std::string::npos);
+}
+
+TEST_F(IR_ShaderVariableInstrumentationTest,
+       FragmentCoordFilter_NonFragmentFunction_NoSetupButStillGated) {
+    // A compute entry point: the match var is still declared because we have
+    // at least one candidate store, but no match assignment happens and so
+    // the gate always reads `false`.
+    auto* ep = b.ComputeFunction("cs");
+    b.Append(ep->Block(), [&] {
+        auto* v = b.Var<function, u32>("v");
+        b.Store(v, 42_u);
+        b.Return(ep);
+    });
+
+    ShaderVariableInstrumentationConfig cfg;
+    cfg.buffer_binding_point = {1, 0};
+    cfg.target_fragment_coord = std::array<uint32_t, 2>{0u, 0u};
+    auto result = RunAndValidate(cfg);
+
+    ASSERT_EQ(result.records.size(), 1u);
+
+    auto ir_text = str();
+    // The private match var is still created and the store is gated.
+    EXPECT_NE(ir_text.find("%tint_shader_debug_match:ptr<private, bool"),
+              std::string::npos);
+    EXPECT_NE(ir_text.find("load %tint_shader_debug_match"), std::string::npos);
+    // But we never computed a match inside the compute entry point.
+    EXPECT_EQ(ir_text.find("store %tint_shader_debug_match"), std::string::npos);
+    EXPECT_EQ(ir_text.find("tint_frag_coord"), std::string::npos);
+}
+
 TEST_F(IR_ShaderVariableInstrumentationTest, TwoStores_SequentialIds) {
     auto* func = b.Function("foo", ty.void_());
     b.Append(func->Block(), [&] {
