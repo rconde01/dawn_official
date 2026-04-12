@@ -55,10 +55,20 @@ const Capabilities kShaderVariableInstrumentationCapabilities{
 };
 
 /// The scalar type of a value that was captured by the instrumentation.
-enum class ShaderVariableInstrumentationScalarType : uint32_t {
-    kU32 = 0,
-    kI32 = 1,
-    kF32 = 2,
+/// The 4-bit tag is stored in the packed record id and determines how
+/// many u32 data words follow the header and how they should be
+/// re-interpreted by the host.
+enum class ShaderVariableInstrumentationDataType : uint32_t {
+    kBool = 0,   // 1 data word: 0u or 1u
+    kI32 = 1,    // 1 data word: bitcast<u32>(i32)
+    kU32 = 2,    // 1 data word: u32
+    kF32 = 3,    // 1 data word: bitcast<u32>(f32)
+    kF16 = 4,    // 1 data word: bitcast<u32>(f32(f16))
+    kI8 = 5,     // 1 data word: u32(i32(i8))
+    kU8 = 6,     // 1 data word: u32(u8)
+    kU16 = 7,    // 1 data word: u32(u16)
+    kU64 = 8,    // 2 data words: lo = bitcast<vec2<u32>>(u64)[0],
+                 //               hi = bitcast<vec2<u32>>(u64)[1]
 };
 
 /// Configuration options for ShaderVariableInstrumentation.
@@ -76,17 +86,22 @@ enum class ShaderVariableInstrumentationScalarType : uint32_t {
 ///       records : array<u32>,
 ///     }
 ///
-/// Each instrumented store appends a 2-u32 record:
+/// Each instrumented store appends a variable-length record:
 ///
-///   records[slot * 2 + 0]:  packed id  (bitfield, see below)
-///   records[slot * 2 + 1]:  the stored value, bitcast to u32
+///   records[slot + 0]:  packed header  (bitfield, see below)
+///   records[slot + 1]:  data word 0
+///   records[slot + 2]:  data word 1    (only for u64)
 ///
-/// The packed id is a u32 bitfield:
+/// The packed header is a u32 bitfield:
 ///
 ///   bits [0:9]   — 10 bits — variable id (0–1023)
-///   bits [10:25] — 16 bits — source line number (0–65535)
-///   bits [26:29] —  4 bits — @builtin(sample_index) (0–15)
-///   bits [30:31] —  2 bits — reserved (zero)
+///   bits [10:23] — 14 bits — source line number (0–16383)
+///   bits [24:27] —  4 bits — data type (ShaderVariableInstrumentationDataType)
+///   bits [28:31] —  4 bits — @builtin(sample_index) (0–15)
+///
+/// The data type tag determines how many data words follow the header
+/// (1 for all types except u64 which uses 2) and how to re-interpret
+/// them on the host.
 ///
 /// The variable id and line number are compile-time constants baked in by
 /// the transform. The sample index is a per-invocation runtime value read
@@ -136,20 +151,29 @@ struct ShaderVariableInstrumentationConfig {
     std::optional<std::array<uint32_t, 2>> target_fragment_coord{};
 };
 
-/// Bit layout constants for the packed record id.
-/// The packed u32 is: `(sample_index << 26) | (line << 10) | variable_id`.
+/// Bit layout constants for the packed record header.
+/// `(sample_index << 28) | (type << 24) | (line << 10) | variable_id`
 struct ShaderVariableInstrumentationIdLayout {
     static constexpr uint32_t kVariableIdBits = 10;
-    static constexpr uint32_t kLineBits = 16;
+    static constexpr uint32_t kLineBits = 14;
+    static constexpr uint32_t kTypeBits = 4;
     static constexpr uint32_t kSampleIndexBits = 4;
 
     static constexpr uint32_t kVariableIdShift = 0;
-    static constexpr uint32_t kLineShift = kVariableIdBits;
-    static constexpr uint32_t kSampleIndexShift = kVariableIdBits + kLineBits;
+    static constexpr uint32_t kLineShift = kVariableIdBits;                        // 10
+    static constexpr uint32_t kTypeShift = kLineShift + kLineBits;                 // 24
+    static constexpr uint32_t kSampleIndexShift = kTypeShift + kTypeBits;          // 28
 
-    static constexpr uint32_t kVariableIdMask = (1u << kVariableIdBits) - 1u;
-    static constexpr uint32_t kLineMask = (1u << kLineBits) - 1u;
-    static constexpr uint32_t kSampleIndexMask = (1u << kSampleIndexBits) - 1u;
+    static constexpr uint32_t kVariableIdMask = (1u << kVariableIdBits) - 1u;      // 0x3FF
+    static constexpr uint32_t kLineMask = (1u << kLineBits) - 1u;                  // 0x3FFF
+    static constexpr uint32_t kTypeMask = (1u << kTypeBits) - 1u;                  // 0xF
+    static constexpr uint32_t kSampleIndexMask = (1u << kSampleIndexBits) - 1u;    // 0xF
+
+    /// @returns the number of u32 data words that follow the header for a
+    /// given data type tag.
+    static constexpr uint32_t DataWordCount(ShaderVariableInstrumentationDataType t) {
+        return t == ShaderVariableInstrumentationDataType::kU64 ? 2u : 1u;
+    }
 };
 
 /// Information about a single instrumented store.
@@ -159,10 +183,10 @@ struct ShaderVariableInstrumentationRecordInfo {
     /// The source line number embedded in the packed record id (16-bit,
     /// clamped to 65535).
     uint32_t line = 0;
-    /// The scalar type of the captured value (used by the debugger to
-    /// re-interpret the u32 record bits).
-    ShaderVariableInstrumentationScalarType scalar_type =
-        ShaderVariableInstrumentationScalarType::kU32;
+    /// The data type tag embedded in the packed header. Also determines how
+    /// many data words follow each occurrence of this record in the buffer.
+    ShaderVariableInstrumentationDataType data_type =
+        ShaderVariableInstrumentationDataType::kU32;
     /// The name of the destination variable, if known, otherwise empty.
     std::string variable_name;
     /// The source location of the originating store, if known.

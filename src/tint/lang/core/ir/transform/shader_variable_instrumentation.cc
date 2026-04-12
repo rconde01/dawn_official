@@ -48,7 +48,12 @@
 #include "src/tint/lang/core/type/manager.h"
 #include "src/tint/lang/core/type/pointer.h"
 #include "src/tint/lang/core/type/struct.h"
+#include "src/tint/lang/core/type/bool.h"
+#include "src/tint/lang/core/type/i8.h"
+#include "src/tint/lang/core/type/u8.h"
+#include "src/tint/lang/core/type/u16.h"
 #include "src/tint/lang/core/type/u32.h"
+#include "src/tint/lang/core/type/u64.h"
 #include "src/tint/lang/core/type/vector.h"
 
 using namespace tint::core::fluent_types;     // NOLINT
@@ -120,11 +125,12 @@ struct State {
 
     /// @returns true if the given Store instruction should be instrumented.
     bool ShouldInstrument(Store* store) {
-        // Only instrument scalar u32/i32/f32 stores. Vectors, matrices, arrays,
-        // structs, booleans and f16 are intentionally excluded from v1 so that
-        // every record can be represented as a single u32 in the debug buffer.
+        // Instrument stores of any scalar type. Vectors, matrices, arrays
+        // and structs are excluded.
         const auto* from_type = store->From()->Type();
-        if (!from_type->IsAnyOf<core::type::U32, core::type::I32, core::type::F32>()) {
+        if (!from_type->IsAnyOf<core::type::Bool, core::type::I32, core::type::U32,
+                                core::type::F32, core::type::F16, core::type::I8,
+                                core::type::U8, core::type::U16, core::type::U64>()) {
             return false;
         }
 
@@ -165,15 +171,19 @@ struct State {
         }
     }
 
-    /// Determine the scalar type tag for a value's type.
-    ShaderVariableInstrumentationScalarType ScalarTypeOf(const core::type::Type* type) {
-        if (type->Is<core::type::I32>()) {
-            return ShaderVariableInstrumentationScalarType::kI32;
-        }
-        if (type->Is<core::type::F32>()) {
-            return ShaderVariableInstrumentationScalarType::kF32;
-        }
-        return ShaderVariableInstrumentationScalarType::kU32;
+    /// Map an IR type to the data-type tag stored in the packed header.
+    ShaderVariableInstrumentationDataType DataTypeOf(const core::type::Type* type) {
+        using DT = ShaderVariableInstrumentationDataType;
+        if (type->Is<core::type::Bool>()) return DT::kBool;
+        if (type->Is<core::type::I32>()) return DT::kI32;
+        if (type->Is<core::type::U32>()) return DT::kU32;
+        if (type->Is<core::type::F32>()) return DT::kF32;
+        if (type->Is<core::type::F16>()) return DT::kF16;
+        if (type->Is<core::type::I8>()) return DT::kI8;
+        if (type->Is<core::type::U8>()) return DT::kU8;
+        if (type->Is<core::type::U16>()) return DT::kU16;
+        if (type->Is<core::type::U64>()) return DT::kU64;
+        return DT::kU32;  // fallback
     }
 
     /// Find the destination variable name for a store, tracing through trivial
@@ -315,57 +325,103 @@ struct State {
                                           config.buffer_binding_point.binding);
     }
 
+    /// Convert a loaded scalar value to one or two u32 data words.
+    /// @param loaded the loaded value
+    /// @param dt the data type tag
+    /// @param[out] words filled with 1 or 2 u32 Values
+    void ScalarToDataWords(Value* loaded, ShaderVariableInstrumentationDataType dt,
+                           Vector<Value*, 2>& words) {
+        using DT = ShaderVariableInstrumentationDataType;
+        switch (dt) {
+            case DT::kU32:
+                words.Push(loaded);
+                break;
+            case DT::kI32:
+            case DT::kF32:
+                // Same size, bitcast directly.
+                words.Push(b.Bitcast(ty.u32(), loaded)->Result());
+                break;
+            case DT::kBool:
+                // select(0u, 1u, bool)
+                words.Push(
+                    b.Call(ty.u32(), core::BuiltinFn::kSelect, 0_u, 1_u, loaded)->Result());
+                break;
+            case DT::kF16:
+                // f16 → f32 → bitcast<u32>
+                words.Push(b.Bitcast(ty.u32(), b.Convert(ty.f32(), loaded))->Result());
+                break;
+            case DT::kI8:
+                // i8 → i32 → bitcast<u32>
+                words.Push(b.Bitcast(ty.u32(), b.Convert(ty.i32(), loaded))->Result());
+                break;
+            case DT::kU8:
+            case DT::kU16:
+                // u8/u16 → u32
+                words.Push(b.Convert(ty.u32(), loaded)->Result());
+                break;
+            case DT::kU64: {
+                // u64 → bitcast<vec2<u32>>, then extract [0] (lo) and [1] (hi).
+                auto* pair = b.Bitcast(ty.vec2<u32>(), loaded)->Result();
+                words.Push(b.Access(ty.u32(), pair, 0_u)->Result());
+                words.Push(b.Access(ty.u32(), pair, 1_u)->Result());
+                break;
+            }
+        }
+    }
+
     /// Emit the body of the instrumentation append-record sequence into the
     /// builder's current insertion point.
     /// @param store the store being instrumented
     /// @param variable_id the 10-bit variable id
-    /// @param line the 16-bit source line number
-    void EmitAppendRecord(Store* store, uint32_t variable_id, uint32_t line) {
+    /// @param line the 14-bit source line number
+    /// @param dt the data type tag
+    void EmitAppendRecord(Store* store,
+                          uint32_t variable_id,
+                          uint32_t line,
+                          ShaderVariableInstrumentationDataType dt) {
         using L = ShaderVariableInstrumentationIdLayout;
-        const auto* val_type = store->From()->Type();
 
-        // Read the value back from the destination pointer so the captured
-        // record reflects what is actually in memory after the user store.
+        // Read the value back from the destination pointer.
         auto* loaded = b.Load(store->To())->Result();
-        Value* bits = nullptr;
-        if (val_type->Is<core::type::U32>()) {
-            bits = loaded;
-        } else {
-            bits = b.Bitcast(ty.u32(), loaded)->Result();
-        }
 
-        // Build the packed id: (sample_index << 26) | (line << 10) | var_id.
-        // The line and variable_id are compile-time constants, so combine them
-        // into a single static value and OR in the runtime sample index.
+        // Convert the loaded value to u32 data words.
+        Vector<Value*, 2> data_words;
+        ScalarToDataWords(loaded, dt, data_words);
+        const uint32_t num_data_words = static_cast<uint32_t>(data_words.Length());
+
+        // Build the packed header:
+        //   (sample_index << 28) | (type << 24) | (line << 10) | var_id
         const uint32_t static_bits =
-            ((line & L::kLineMask) << L::kLineShift) | (variable_id & L::kVariableIdMask);
+            (static_cast<uint32_t>(dt) << L::kTypeShift) |
+            ((line & L::kLineMask) << L::kLineShift) |
+            (variable_id & L::kVariableIdMask);
         auto* si = b.Load(sample_index_var)->Result();
         auto* si_masked = b.And(si, u32(L::kSampleIndexMask))->Result();
         auto* si_shifted = b.ShiftLeft(si_masked, u32(L::kSampleIndexShift))->Result();
-        auto* packed_id = b.Or(si_shifted, u32(static_bits))->Result();
+        auto* packed_header = b.Or(si_shifted, u32(static_bits))->Result();
 
-        // slot = atomicAdd(&buffer.cursor, 1u)
+        // Reserve 1 (header) + num_data_words entries in the records array.
         auto* cursor_ptr = b.Access(
             ty.ptr(core::AddressSpace::kStorage, ty.atomic<u32>(), core::Access::kReadWrite),
             debug_buffer_var, u32(kCursorMemberIndex));
-        auto* slot = b.Call(ty.u32(), core::BuiltinFn::kAtomicAdd, cursor_ptr, 1_u)->Result();
+        auto* slot = b.Call(ty.u32(), core::BuiltinFn::kAtomicAdd, cursor_ptr,
+                            u32(1u + num_data_words))
+                         ->Result();
 
-        // idx = slot * 2u
-        auto* idx = b.Multiply(slot, 2_u)->Result();
-        // idx_plus_one = idx + 1u
-        auto* idx_plus_one = b.Add(idx, 1_u)->Result();
-
-        // records[idx] = packed_id
-        auto* id_ptr = b.Access(
+        // records[slot] = packed_header
+        auto* hdr_ptr = b.Access(
             ty.ptr(core::AddressSpace::kStorage, ty.u32(), core::Access::kReadWrite),
-            debug_buffer_var, u32(kRecordsMemberIndex), idx);
-        b.Store(id_ptr, packed_id);
+            debug_buffer_var, u32(kRecordsMemberIndex), slot);
+        b.Store(hdr_ptr, packed_header);
 
-        // records[idx + 1] = bits
-        auto* value_ptr = b.Access(
-            ty.ptr(core::AddressSpace::kStorage, ty.u32(), core::Access::kReadWrite),
-            debug_buffer_var, u32(kRecordsMemberIndex), idx_plus_one);
-        b.Store(value_ptr, bits);
+        // records[slot + 1 + i] = data_words[i]
+        for (uint32_t i = 0; i < num_data_words; i++) {
+            auto* data_idx = b.Add(slot, u32(1u + i))->Result();
+            auto* data_ptr = b.Access(
+                ty.ptr(core::AddressSpace::kStorage, ty.u32(), core::Access::kReadWrite),
+                debug_buffer_var, u32(kRecordsMemberIndex), data_idx);
+            b.Store(data_ptr, data_words[i]);
+        }
     }
 
     /// Emit the instrumentation sequence for a single store, optionally gated
@@ -373,16 +429,19 @@ struct State {
     /// @param store the store being instrumented
     /// @param variable_id the 10-bit variable id
     /// @param line the 16-bit source line number
-    void EmitInstrumentation(Store* store, uint32_t variable_id, uint32_t line) {
+    void EmitInstrumentation(Store* store,
+                             uint32_t variable_id,
+                             uint32_t line,
+                             ShaderVariableInstrumentationDataType dt) {
         b.InsertAfter(store, [&] {
             if (match_var == nullptr) {
-                EmitAppendRecord(store, variable_id, line);
+                EmitAppendRecord(store, variable_id, line, dt);
                 return;
             }
             auto* cond = b.Load(match_var)->Result();
             auto* ifelse = b.If(cond);
             b.Append(ifelse->True(), [&] {
-                EmitAppendRecord(store, variable_id, line);
+                EmitAppendRecord(store, variable_id, line, dt);
                 b.ExitIf(ifelse);
             });
         });
@@ -427,15 +486,17 @@ struct State {
                                       ? static_cast<uint32_t>(src.range.begin.line)
                                       : L::kLineMask;
 
+            auto dt = DataTypeOf(store->From()->Type());
+
             ShaderVariableInstrumentationRecordInfo info;
             info.variable_id = variable_id;
             info.line = line;
-            info.scalar_type = ScalarTypeOf(store->From()->Type());
+            info.data_type = dt;
             info.variable_name = NameOfDestination(store);
             info.source = src;
             records.push_back(std::move(info));
 
-            EmitInstrumentation(store, variable_id, line);
+            EmitInstrumentation(store, variable_id, line, dt);
         }
 
         ShaderVariableInstrumentationResult result;

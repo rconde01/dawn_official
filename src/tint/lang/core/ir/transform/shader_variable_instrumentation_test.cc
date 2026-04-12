@@ -133,8 +133,8 @@ TEST_F(IR_ShaderVariableInstrumentationTest, SingleU32Store_FunctionVar) {
     // name is `v`.
     ASSERT_EQ(result.records.size(), 1u);
     EXPECT_EQ(result.records[0].variable_id, 0u);
-    EXPECT_EQ(result.records[0].scalar_type,
-              ShaderVariableInstrumentationScalarType::kU32);
+    EXPECT_EQ(result.records[0].data_type,
+              ShaderVariableInstrumentationDataType::kU32);
     EXPECT_EQ(result.records[0].variable_name, "v");
 
     // The packed id is: (sample_index << 26) | (line << 10) | var_id.
@@ -157,8 +157,8 @@ TEST_F(IR_ShaderVariableInstrumentationTest, I32Store_UsesBitcast) {
     auto result = RunAndValidate(cfg);
 
     ASSERT_EQ(result.records.size(), 1u);
-    EXPECT_EQ(result.records[0].scalar_type,
-              ShaderVariableInstrumentationScalarType::kI32);
+    EXPECT_EQ(result.records[0].data_type,
+              ShaderVariableInstrumentationDataType::kI32);
     EXPECT_EQ(result.records[0].variable_name, "v");
 }
 
@@ -180,6 +180,29 @@ TEST_F(IR_ShaderVariableInstrumentationTest, VectorStore_NotInstrumented) {
     // Non-scalar stores are not supported by v1; the IR should be unchanged.
     EXPECT_EQ(before, str());
     EXPECT_EQ(result.records.size(), 0u);
+}
+
+TEST_F(IR_ShaderVariableInstrumentationTest, BoolStore_UsesSelect) {
+    auto* func = b.Function("foo", ty.void_());
+    b.Append(func->Block(), [&] {
+        auto* v = b.Var<function, bool>("v");
+        b.Store(v, true);
+        b.Return(func);
+    });
+
+    ShaderVariableInstrumentationConfig cfg;
+    cfg.buffer_binding_point = {1, 0};
+    auto result = RunAndValidate(cfg);
+
+    ASSERT_EQ(result.records.size(), 1u);
+    EXPECT_EQ(result.records[0].data_type,
+              ShaderVariableInstrumentationDataType::kBool);
+    EXPECT_EQ(result.records[0].variable_name, "v");
+
+    // The IR should contain a `select 0u, 1u, <loaded_bool>` to convert
+    // the boolean to a u32.
+    auto ir_text = str();
+    EXPECT_NE(ir_text.find("select"), std::string::npos);
 }
 
 TEST_F(IR_ShaderVariableInstrumentationTest,
@@ -296,12 +319,12 @@ TEST_F(IR_ShaderVariableInstrumentationTest, TwoStores_SequentialIds) {
 
     ASSERT_EQ(result.records.size(), 2u);
     EXPECT_EQ(result.records[0].variable_id, 0u);
-    EXPECT_EQ(result.records[0].scalar_type,
-              ShaderVariableInstrumentationScalarType::kU32);
+    EXPECT_EQ(result.records[0].data_type,
+              ShaderVariableInstrumentationDataType::kU32);
     EXPECT_EQ(result.records[0].variable_name, "a");
     EXPECT_EQ(result.records[1].variable_id, 1u);
-    EXPECT_EQ(result.records[1].scalar_type,
-              ShaderVariableInstrumentationScalarType::kF32);
+    EXPECT_EQ(result.records[1].data_type,
+              ShaderVariableInstrumentationDataType::kF32);
     EXPECT_EQ(result.records[1].variable_name, "b");
 }
 
