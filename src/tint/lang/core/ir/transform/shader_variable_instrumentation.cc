@@ -84,7 +84,11 @@ struct State {
     /// the current invocation should record debug data. Created lazily.
     Var* match_var = nullptr;
 
-    /// The accumulated records, indexed by assigned id.
+    /// Private var holding the per-invocation `@builtin(sample_index)` value
+    /// so it is accessible from non-entry-point functions. Created lazily.
+    Var* sample_index_var = nullptr;
+
+    /// The accumulated records, indexed by variable_id.
     std::vector<ShaderVariableInstrumentationRecordInfo> records{};
 
     /// Walk back through trivial chain instructions (Let, Access) to find the
@@ -201,10 +205,23 @@ struct State {
         });
     }
 
+    /// Create (once) the `var<private> tint_sample_index : u32 = 0u`
+    /// variable used to forward the sample_index builtin to non-entry-point
+    /// functions.
+    void EnsureSampleIndexVar() {
+        if (sample_index_var != nullptr) {
+            return;
+        }
+        b.Append(ir.root_block, [&] {
+            sample_index_var = b.Var("tint_sample_index",
+                                     ty.ptr(core::AddressSpace::kPrivate, ty.u32(),
+                                            core::Access::kReadWrite));
+            sample_index_var->SetInitializer(b.Constant(0_u));
+        });
+    }
+
     /// Find the `@builtin(position)` parameter of a function, adding one if
     /// none exists.
-    /// @param func the function that needs a position parameter
-    /// @returns the position parameter
     FunctionParam* GetOrAddPositionParam(Function* func) {
         for (auto* param : func->Params()) {
             if (param->Builtin() == core::BuiltinValue::kPosition) {
@@ -217,33 +234,53 @@ struct State {
         return pos;
     }
 
-    /// Insert the `tint_shader_debug_match = (u32(pos.x) == tx) & (u32(pos.y) == ty)`
-    /// assignment at the start of the given fragment entry point's body.
-    /// @param func the fragment entry point
-    void SetupFragmentEntryPoint(Function* func) {
-        TINT_IR_ASSERT(ir, config.target_fragment_coord.has_value());
-        const auto& xy = *config.target_fragment_coord;
-
-        auto* pos = GetOrAddPositionParam(func);
-
-        auto* body = func->Block();
-        auto insert_at_top = [&](auto&& cb) {
-            if (body->IsEmpty()) {
-                b.Append(body, cb);
-            } else {
-                b.InsertBefore(body->Front(), cb);
+    /// Find the `@builtin(sample_index)` parameter of a function, adding one
+    /// if none exists.
+    FunctionParam* GetOrAddSampleIndexParam(Function* func) {
+        for (auto* param : func->Params()) {
+            if (param->Builtin() == core::BuiltinValue::kSampleIndex) {
+                return param;
             }
-        };
+        }
+        auto* si = b.FunctionParam("tint_sample_idx", ty.u32());
+        si->SetBuiltin(core::BuiltinValue::kSampleIndex);
+        func->AppendParam(si);
+        return si;
+    }
 
-        insert_at_top([&] {
-            auto* px = b.Access(ty.f32(), pos, 0_u)->Result();
-            auto* py = b.Access(ty.f32(), pos, 1_u)->Result();
-            auto* uxv = b.Convert(ty.u32(), px)->Result();
-            auto* uyv = b.Convert(ty.u32(), py)->Result();
-            auto* eq_x = b.Equal(uxv, u32(xy[0]))->Result();
-            auto* eq_y = b.Equal(uyv, u32(xy[1]))->Result();
-            auto* matches = b.And(eq_x, eq_y)->Result();
-            b.Store(match_var, matches);
+    /// Insert-at-top helper. Inserts instructions produced by @p cb before
+    /// any existing instructions in @p func's body.
+    template <typename CB>
+    void InsertAtTopOfFunction(Function* func, CB&& cb) {
+        auto* body = func->Block();
+        if (body->IsEmpty()) {
+            b.Append(body, cb);
+        } else {
+            b.InsertBefore(body->Front(), cb);
+        }
+    }
+
+    /// Set up a fragment entry point:
+    ///   1. Store `@builtin(sample_index)` into the private var.
+    ///   2. If `target_fragment_coord` is set, compute the match flag.
+    void SetupFragmentEntryPoint(Function* func) {
+        auto* si_param = GetOrAddSampleIndexParam(func);
+
+        InsertAtTopOfFunction(func, [&] {
+            b.Store(sample_index_var, si_param);
+
+            if (config.target_fragment_coord.has_value()) {
+                const auto& xy = *config.target_fragment_coord;
+                auto* pos = GetOrAddPositionParam(func);
+                auto* px = b.Access(ty.f32(), pos, 0_u)->Result();
+                auto* py = b.Access(ty.f32(), pos, 1_u)->Result();
+                auto* uxv = b.Convert(ty.u32(), px)->Result();
+                auto* uyv = b.Convert(ty.u32(), py)->Result();
+                auto* eq_x = b.Equal(uxv, u32(xy[0]))->Result();
+                auto* eq_y = b.Equal(uyv, u32(xy[1]))->Result();
+                auto* matches = b.And(eq_x, eq_y)->Result();
+                b.Store(match_var, matches);
+            }
         });
     }
 
@@ -256,29 +293,15 @@ struct State {
         }
     }
 
-    /// @returns true if the cursor field should be `atomic<u32>`. The cursor
-    /// only needs to be atomic when more than one invocation might race on
-    /// the increment. When `target_fragment_coord` is set, only the
-    /// invocation whose `(u32(pos.x), u32(pos.y))` matches passes the gate,
-    /// so the cursor can be a plain `u32`.
-    bool UseAtomicCursor() const { return !config.target_fragment_coord.has_value(); }
-
     /// Create (once) the debug storage buffer variable and its struct type.
     void EnsureDebugBuffer() {
         if (debug_buffer_var != nullptr) {
             return;
         }
-        // struct tint_shader_debug_buffer {
-        //   cursor  : atomic<u32> | u32,   // atomic only if no fragment filter
-        //   records : array<u32>,
-        // }
-        const core::type::Type* cursor_ty =
-            UseAtomicCursor() ? static_cast<const core::type::Type*>(ty.atomic<u32>())
-                              : static_cast<const core::type::Type*>(ty.u32());
         debug_buffer_struct =
             ty.Struct(ir.symbols.New("tint_shader_debug_buffer"),
                       {
-                          {ir.symbols.Register("cursor"), cursor_ty},
+                          {ir.symbols.Register("cursor"), ty.atomic<u32>()},
                           {ir.symbols.Register("records"), ty.array<u32>()},
                       });
 
@@ -295,15 +318,14 @@ struct State {
     /// Emit the body of the instrumentation append-record sequence into the
     /// builder's current insertion point.
     /// @param store the store being instrumented
-    /// @param id the assigned record id
-    void EmitAppendRecord(Store* store, uint32_t id) {
+    /// @param variable_id the 10-bit variable id
+    /// @param line the 16-bit source line number
+    void EmitAppendRecord(Store* store, uint32_t variable_id, uint32_t line) {
+        using L = ShaderVariableInstrumentationIdLayout;
         const auto* val_type = store->From()->Type();
 
         // Read the value back from the destination pointer so the captured
-        // record reflects what is actually in memory after the user store,
-        // rather than the source expression of the store. This guarantees the
-        // debugger sees the same bits the rest of the shader will read, even
-        // if a later transform rewrites or DCEs the source expression.
+        // record reflects what is actually in memory after the user store.
         auto* loaded = b.Load(store->To())->Result();
         Value* bits = nullptr;
         if (val_type->Is<core::type::U32>()) {
@@ -312,37 +334,32 @@ struct State {
             bits = b.Bitcast(ty.u32(), loaded)->Result();
         }
 
-        // Reserve a slot in the records array.
-        Value* slot = nullptr;
-        if (UseAtomicCursor()) {
-            // slot = atomicAdd(&buffer.cursor, 1u)
-            auto* cursor_ptr = b.Access(
-                ty.ptr(core::AddressSpace::kStorage, ty.atomic<u32>(), core::Access::kReadWrite),
-                debug_buffer_var, u32(kCursorMemberIndex));
-            slot = b.Call(ty.u32(), core::BuiltinFn::kAtomicAdd, cursor_ptr, 1_u)->Result();
-        } else {
-            // The fragment-coord gate guarantees a single invocation reaches
-            // here, so we can use a plain load/add/store on a non-atomic u32:
-            //   slot = buffer.cursor;
-            //   buffer.cursor = slot + 1u;
-            auto* cursor_ptr = b.Access(
-                ty.ptr(core::AddressSpace::kStorage, ty.u32(), core::Access::kReadWrite),
-                debug_buffer_var, u32(kCursorMemberIndex));
-            slot = b.Load(cursor_ptr)->Result();
-            auto* next = b.Add(slot, 1_u)->Result();
-            b.Store(cursor_ptr, next);
-        }
+        // Build the packed id: (sample_index << 26) | (line << 10) | var_id.
+        // The line and variable_id are compile-time constants, so combine them
+        // into a single static value and OR in the runtime sample index.
+        const uint32_t static_bits =
+            ((line & L::kLineMask) << L::kLineShift) | (variable_id & L::kVariableIdMask);
+        auto* si = b.Load(sample_index_var)->Result();
+        auto* si_masked = b.And(si, u32(L::kSampleIndexMask))->Result();
+        auto* si_shifted = b.ShiftLeft(si_masked, u32(L::kSampleIndexShift))->Result();
+        auto* packed_id = b.Or(si_shifted, u32(static_bits))->Result();
+
+        // slot = atomicAdd(&buffer.cursor, 1u)
+        auto* cursor_ptr = b.Access(
+            ty.ptr(core::AddressSpace::kStorage, ty.atomic<u32>(), core::Access::kReadWrite),
+            debug_buffer_var, u32(kCursorMemberIndex));
+        auto* slot = b.Call(ty.u32(), core::BuiltinFn::kAtomicAdd, cursor_ptr, 1_u)->Result();
 
         // idx = slot * 2u
         auto* idx = b.Multiply(slot, 2_u)->Result();
         // idx_plus_one = idx + 1u
         auto* idx_plus_one = b.Add(idx, 1_u)->Result();
 
-        // records[idx] = id
+        // records[idx] = packed_id
         auto* id_ptr = b.Access(
             ty.ptr(core::AddressSpace::kStorage, ty.u32(), core::Access::kReadWrite),
             debug_buffer_var, u32(kRecordsMemberIndex), idx);
-        b.Store(id_ptr, u32(id));
+        b.Store(id_ptr, packed_id);
 
         // records[idx + 1] = bits
         auto* value_ptr = b.Access(
@@ -354,19 +371,18 @@ struct State {
     /// Emit the instrumentation sequence for a single store, optionally gated
     /// by the per-invocation match flag.
     /// @param store the store being instrumented
-    /// @param id the assigned record id
-    void EmitInstrumentation(Store* store, uint32_t id) {
+    /// @param variable_id the 10-bit variable id
+    /// @param line the 16-bit source line number
+    void EmitInstrumentation(Store* store, uint32_t variable_id, uint32_t line) {
         b.InsertAfter(store, [&] {
             if (match_var == nullptr) {
-                EmitAppendRecord(store, id);
+                EmitAppendRecord(store, variable_id, line);
                 return;
             }
-            // Gate the append on the per-invocation match flag:
-            //   if (tint_shader_debug_match) { ... }
             auto* cond = b.Load(match_var)->Result();
             auto* ifelse = b.If(cond);
             b.Append(ifelse->True(), [&] {
-                EmitAppendRecord(store, id);
+                EmitAppendRecord(store, variable_id, line);
                 b.ExitIf(ifelse);
             });
         });
@@ -390,35 +406,36 @@ struct State {
             return {};
         }
 
-        // Create the debug buffer. It is important that this happens *after*
-        // we have finished the candidate scan, so that the Var and Stores we
-        // introduce for the buffer itself are never candidates themselves.
+        // Create the debug buffer and the sample-index private var. It is
+        // important that these happen *after* we have finished the candidate
+        // scan, so that the Vars and Stores we introduce are never candidates.
         EnsureDebugBuffer();
-
-        // If the caller asked us to filter by a specific fragment coordinate,
-        // create the per-invocation match flag and rewrite every fragment
-        // entry point so that it assigns the flag before any user code runs.
-        // The store emitted here is safe because candidate collection already
-        // finished — the match store targets the `private` match var which
-        // has no binding point, but it is still filtered out by the address
-        // space check in ShouldInstrument (which we run before collection).
+        EnsureSampleIndexVar();
         if (config.target_fragment_coord.has_value()) {
             EnsureMatchVar();
-            SetupAllFragmentEntryPoints();
         }
+        SetupAllFragmentEntryPoints();
 
-        // Second pass: instrument each candidate, assigning a sequential id.
+        // Second pass: instrument each candidate.
+        using L = ShaderVariableInstrumentationIdLayout;
         for (auto* store : candidates) {
-            const uint32_t id = static_cast<uint32_t>(records.size());
+            const uint32_t variable_id =
+                static_cast<uint32_t>(records.size()) & L::kVariableIdMask;
+
+            auto src = ir.SourceOf(store);
+            const uint32_t line = src.range.begin.line <= L::kLineMask
+                                      ? static_cast<uint32_t>(src.range.begin.line)
+                                      : L::kLineMask;
 
             ShaderVariableInstrumentationRecordInfo info;
-            info.id = id;
+            info.variable_id = variable_id;
+            info.line = line;
             info.scalar_type = ScalarTypeOf(store->From()->Type());
             info.variable_name = NameOfDestination(store);
-            info.source = ir.SourceOf(store);
+            info.source = src;
             records.push_back(std::move(info));
 
-            EmitInstrumentation(store, id);
+            EmitInstrumentation(store, variable_id, line);
         }
 
         ShaderVariableInstrumentationResult result;

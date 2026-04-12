@@ -72,20 +72,34 @@ enum class ShaderVariableInstrumentationScalarType : uint32_t {
 /// buffer has the following logical layout:
 ///
 ///     struct TintDebugBuffer {
-///       // Cursor incremented each time a store is observed. The field is
-///       // `atomic<u32>` by default. When `target_fragment_coord` is set,
-///       // only one invocation passes the gate, so the cursor is emitted as
-///       // a plain `u32` and incremented with a non-atomic load/add/store.
-///       cursor : atomic<u32>,  // or u32 (see above)
-///       // A flat array of u32 records. Each record is 2 u32s:
-///       //   records[slot * 2 + 0] : the store id assigned by the transform
-///       //   records[slot * 2 + 1] : the stored value, bitcast to u32
+///       cursor  : atomic<u32>,
 ///       records : array<u32>,
 ///     }
 ///
-/// The result of the transform provides a mapping from each assigned id back
-/// to the source location and destination name of the store, which the
-/// debugger can use to present captured values.
+/// Each instrumented store appends a 2-u32 record:
+///
+///   records[slot * 2 + 0]:  packed id  (bitfield, see below)
+///   records[slot * 2 + 1]:  the stored value, bitcast to u32
+///
+/// The packed id is a u32 bitfield:
+///
+///   bits [0:9]   — 10 bits — variable id (0–1023)
+///   bits [10:25] — 16 bits — source line number (0–65535)
+///   bits [26:29] —  4 bits — @builtin(sample_index) (0–15)
+///   bits [30:31] —  2 bits — reserved (zero)
+///
+/// The variable id and line number are compile-time constants baked in by
+/// the transform. The sample index is a per-invocation runtime value read
+/// from a `@builtin(sample_index)` parameter that the transform adds to
+/// every fragment entry point (reusing an existing one if it already
+/// exists). Adding this builtin enables per-sample shading for fragment
+/// stages.
+///
+/// For vertex and compute entry points, the sample index bits are always 0.
+///
+/// The result of the transform provides a mapping from each assigned
+/// variable id back to the variable name, scalar type and source
+/// location.
 struct ShaderVariableInstrumentationConfig {
     /// The binding point to use for the debug storage buffer added by the
     /// transform.
@@ -115,28 +129,36 @@ struct ShaderVariableInstrumentationConfig {
     /// The flag lives in the `private` address space, so it is per-invocation
     /// and is therefore also `false` for vertex and compute invocations that
     /// happen to share the module. As a result, when this option is set only
-    /// the targeted fragment invocation produces any debug records.
-    ///
-    /// Caveats — when this option is set, the transform also drops the
-    /// `atomic<u32>` cursor in favour of a plain `u32`. That is sound under
-    /// the assumption that *exactly one* fragment invocation matches the
-    /// target coordinate. The cases where that assumption can break:
-    ///   * MSAA render targets — multiple sample invocations of the same
-    ///     pixel will all pass the gate. Filter additionally on
-    ///     `@builtin(sample_index)` from the host side, or render to a
-    ///     non-MSAA target when debugging.
-    ///   * Multiple draw calls that hit the same pixel between buffer reads.
-    ///     The non-atomic increment is still well-defined when invocations
-    ///     are serialised by ROP, but if you draw twice without resetting the
-    ///     cursor in between, the second draw's records will append after
-    ///     the first.
+    /// the targeted fragment invocation(s) produce any debug records.
+    /// Under MSAA, each sample of the same pixel is a separate invocation
+    /// that passes the gate; the sample index in the packed id distinguishes
+    /// them.
     std::optional<std::array<uint32_t, 2>> target_fragment_coord{};
+};
+
+/// Bit layout constants for the packed record id.
+/// The packed u32 is: `(sample_index << 26) | (line << 10) | variable_id`.
+struct ShaderVariableInstrumentationIdLayout {
+    static constexpr uint32_t kVariableIdBits = 10;
+    static constexpr uint32_t kLineBits = 16;
+    static constexpr uint32_t kSampleIndexBits = 4;
+
+    static constexpr uint32_t kVariableIdShift = 0;
+    static constexpr uint32_t kLineShift = kVariableIdBits;
+    static constexpr uint32_t kSampleIndexShift = kVariableIdBits + kLineBits;
+
+    static constexpr uint32_t kVariableIdMask = (1u << kVariableIdBits) - 1u;
+    static constexpr uint32_t kLineMask = (1u << kLineBits) - 1u;
+    static constexpr uint32_t kSampleIndexMask = (1u << kSampleIndexBits) - 1u;
 };
 
 /// Information about a single instrumented store.
 struct ShaderVariableInstrumentationRecordInfo {
-    /// The numeric id written to the debug buffer when this store executes.
-    uint32_t id = 0;
+    /// The 10-bit variable id embedded in the packed record id.
+    uint32_t variable_id = 0;
+    /// The source line number embedded in the packed record id (16-bit,
+    /// clamped to 65535).
+    uint32_t line = 0;
     /// The scalar type of the captured value (used by the debugger to
     /// re-interpret the u32 record bits).
     ShaderVariableInstrumentationScalarType scalar_type =
