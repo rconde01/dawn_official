@@ -94,8 +94,12 @@ struct State {
     /// so it is accessible from non-entry-point functions. Created lazily.
     Var* sample_index_var = nullptr;
 
-    /// The accumulated records, indexed by variable_id.
-    std::vector<ShaderVariableInstrumentationRecordInfo> records{};
+    /// Map from Var* to the assigned variable_id. Each unique Var gets one
+    /// id, shared across all stores to that variable.
+    Hashmap<Var*, uint32_t, 64> var_id_map{};
+
+    /// The accumulated variable info entries, indexed by variable_id.
+    std::vector<ShaderVariableInstrumentationVariableInfo> variables{};
 
     /// Walk back through trivial chain instructions (Let, Access) to find the
     /// originating Var for a pointer value.
@@ -233,21 +237,6 @@ struct State {
         }
 
         return ScalarDataType(type);
-    }
-
-    /// Find the destination variable name for a store, tracing through trivial
-    /// chain instructions.
-    /// @returns the name, or an empty string if none could be determined.
-    std::string NameOfDestination(Store* store) {
-        auto* var = OriginatingVar(store->To());
-        if (var == nullptr) {
-            return "";
-        }
-        auto sym = ir.NameOf(var->Result());
-        if (!sym.IsValid()) {
-            return "";
-        }
-        return sym.Name();
     }
 
     /// Create (once) the `var<private> tint_shader_debug_match : bool = false`
@@ -550,32 +539,54 @@ struct State {
         }
         SetupAllFragmentEntryPoints();
 
-        // Second pass: instrument each candidate.
+        // Second pass: instrument each candidate. Variable ids are assigned
+        // per unique Var (not per store), so multiple stores to the same
+        // variable share one id.
         using L = ShaderVariableInstrumentationIdLayout;
         for (auto* store : candidates) {
-            const uint32_t variable_id =
-                static_cast<uint32_t>(records.size()) & L::kVariableIdMask;
+            auto* var = OriginatingVar(store->To());
+            TINT_IR_ASSERT(ir, var != nullptr);
 
-            auto src = ir.SourceOf(store);
-            const uint32_t line = src.range.begin.line <= L::kLineMask
-                                      ? static_cast<uint32_t>(src.range.begin.line)
-                                      : L::kLineMask;
+            // Get-or-create a variable_id for this Var.
+            auto variable_id = var_id_map.GetOrAdd(var, [&]() {
+                const uint32_t id =
+                    static_cast<uint32_t>(variables.size()) & L::kVariableIdMask;
+
+                auto dt = DataTypeOf(store->From()->Type());
+
+                // Declaration source from the Var instruction itself.
+                auto decl_src = ir.SourceOf(var);
+                const uint32_t decl_line =
+                    decl_src.range.begin.line <= L::kLineMask
+                        ? static_cast<uint32_t>(decl_src.range.begin.line)
+                        : L::kLineMask;
+
+                ShaderVariableInstrumentationVariableInfo info;
+                info.variable_id = id;
+                info.data_type = dt;
+                auto sym = ir.NameOf(var->Result());
+                info.name = sym.IsValid() ? sym.Name() : "";
+                info.declaration_line = decl_line;
+                info.declaration_source = decl_src;
+                variables.push_back(std::move(info));
+
+                return id;
+            });
+
+            // The line in the packed header is the line of the *store*
+            // instruction (where the update happened), not the declaration.
+            auto store_src = ir.SourceOf(store);
+            const uint32_t store_line =
+                store_src.range.begin.line <= L::kLineMask
+                    ? static_cast<uint32_t>(store_src.range.begin.line)
+                    : L::kLineMask;
 
             auto dt = DataTypeOf(store->From()->Type());
-
-            ShaderVariableInstrumentationRecordInfo info;
-            info.variable_id = variable_id;
-            info.line = line;
-            info.data_type = dt;
-            info.variable_name = NameOfDestination(store);
-            info.source = src;
-            records.push_back(std::move(info));
-
-            EmitInstrumentation(store, variable_id, line, dt);
+            EmitInstrumentation(store, variable_id, store_line, dt);
         }
 
         ShaderVariableInstrumentationResult result;
-        result.records = std::move(records);
+        result.variables = std::move(variables);
         return result;
     }
 };

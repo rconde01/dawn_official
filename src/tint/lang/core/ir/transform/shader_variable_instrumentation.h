@@ -211,28 +211,29 @@ struct ShaderVariableInstrumentationIdLayout {
     }
 };
 
-/// Information about a single instrumented store.
-struct ShaderVariableInstrumentationRecordInfo {
-    /// The 10-bit variable id embedded in the packed record id.
+/// Information about an instrumented variable, indexed by variable_id.
+struct ShaderVariableInstrumentationVariableInfo {
+    /// The 10-bit variable id embedded in every record header that refers
+    /// to this variable.
     uint32_t variable_id = 0;
-    /// The source line number embedded in the packed record id (16-bit,
-    /// clamped to 65535).
-    uint32_t line = 0;
     /// The data type tag embedded in the packed header. Also determines how
-    /// many data words follow each occurrence of this record in the buffer.
+    /// many data words follow each occurrence of this variable's records.
     ShaderVariableInstrumentationDataType data_type =
         ShaderVariableInstrumentationDataType::kU32;
-    /// The name of the destination variable, if known, otherwise empty.
-    std::string variable_name;
-    /// The source location of the originating store, if known.
-    Source source;
+    /// The name of the variable, if known, otherwise empty.
+    std::string name;
+    /// The source line of the variable's declaration (the `var` instruction),
+    /// or 0 if no source info is available.
+    uint32_t declaration_line = 0;
+    /// The full source location of the variable's declaration, if known.
+    Source declaration_source;
 };
 
 /// The result of running ShaderVariableInstrumentation.
 struct ShaderVariableInstrumentationResult {
-    /// One entry per instrumented store, indexed by the id written to the
-    /// debug buffer.
-    std::vector<ShaderVariableInstrumentationRecordInfo> records;
+    /// One entry per unique instrumented variable. The vector index equals
+    /// the variable's 10-bit id that appears in the packed record headers.
+    std::vector<ShaderVariableInstrumentationVariableInfo> variables;
 };
 
 /// ShaderVariableInstrumentation is a transform used by the WebGPU debugger to

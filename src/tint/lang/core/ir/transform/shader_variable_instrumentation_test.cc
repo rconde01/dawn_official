@@ -79,7 +79,7 @@ TEST_F(IR_ShaderVariableInstrumentationTest, NoStores_NoModify) {
 
     // No stores means no debug buffer is introduced and no records emitted.
     EXPECT_EQ(src, str());
-    EXPECT_EQ(result.records.size(), 0u);
+    EXPECT_EQ(result.variables.size(), 0u);
 }
 
 TEST_F(IR_ShaderVariableInstrumentationTest, StoresToStorageBuffer_NotInstrumented) {
@@ -114,7 +114,7 @@ $B1: {  # root
     // Stores into storage buffers are user outputs; the transform leaves them
     // alone and therefore never introduces the debug buffer.
     EXPECT_EQ(src, str());
-    EXPECT_EQ(result.records.size(), 0u);
+    EXPECT_EQ(result.variables.size(), 0u);
 }
 
 TEST_F(IR_ShaderVariableInstrumentationTest, SingleU32Store_FunctionVar) {
@@ -131,11 +131,11 @@ TEST_F(IR_ShaderVariableInstrumentationTest, SingleU32Store_FunctionVar) {
 
     // The transform should have recorded a single u32 store whose destination
     // name is `v`.
-    ASSERT_EQ(result.records.size(), 1u);
-    EXPECT_EQ(result.records[0].variable_id, 0u);
-    EXPECT_EQ(result.records[0].data_type,
+    ASSERT_EQ(result.variables.size(), 1u);
+    EXPECT_EQ(result.variables[0].variable_id, 0u);
+    EXPECT_EQ(result.variables[0].data_type,
               ShaderVariableInstrumentationDataType::kU32);
-    EXPECT_EQ(result.records[0].variable_name, "v");
+    EXPECT_EQ(result.variables[0].name, "v");
 
     // The packed id is: (sample_index << 26) | (line << 10) | var_id.
     // No source info so line = 0, non-fragment so sample = 0.
@@ -156,10 +156,10 @@ TEST_F(IR_ShaderVariableInstrumentationTest, I32Store_UsesBitcast) {
     cfg.buffer_binding_point = {1, 0};
     auto result = RunAndValidate(cfg);
 
-    ASSERT_EQ(result.records.size(), 1u);
-    EXPECT_EQ(result.records[0].data_type,
+    ASSERT_EQ(result.variables.size(), 1u);
+    EXPECT_EQ(result.variables[0].data_type,
               ShaderVariableInstrumentationDataType::kI32);
-    EXPECT_EQ(result.records[0].variable_name, "v");
+    EXPECT_EQ(result.variables[0].name, "v");
 }
 
 TEST_F(IR_ShaderVariableInstrumentationTest, Vec4F32Store_Instrumented) {
@@ -174,10 +174,10 @@ TEST_F(IR_ShaderVariableInstrumentationTest, Vec4F32Store_Instrumented) {
     cfg.buffer_binding_point = {1, 0};
     auto result = RunAndValidate(cfg);
 
-    ASSERT_EQ(result.records.size(), 1u);
-    EXPECT_EQ(result.records[0].data_type,
+    ASSERT_EQ(result.variables.size(), 1u);
+    EXPECT_EQ(result.variables[0].data_type,
               ShaderVariableInstrumentationDataType::kVec4F32);
-    EXPECT_EQ(result.records[0].variable_name, "v");
+    EXPECT_EQ(result.variables[0].name, "v");
 
     // vec4<f32> produces 4 data words; cursor should advance by 5
     // (1 header + 4 data words).
@@ -199,10 +199,10 @@ TEST_F(IR_ShaderVariableInstrumentationTest, BoolStore_UsesSelect) {
     cfg.buffer_binding_point = {1, 0};
     auto result = RunAndValidate(cfg);
 
-    ASSERT_EQ(result.records.size(), 1u);
-    EXPECT_EQ(result.records[0].data_type,
+    ASSERT_EQ(result.variables.size(), 1u);
+    EXPECT_EQ(result.variables[0].data_type,
               ShaderVariableInstrumentationDataType::kBool);
-    EXPECT_EQ(result.records[0].variable_name, "v");
+    EXPECT_EQ(result.variables[0].name, "v");
 
     // The IR should contain a `select 0u, 1u, <loaded_bool>` to convert
     // the boolean to a u32.
@@ -225,7 +225,7 @@ TEST_F(IR_ShaderVariableInstrumentationTest,
     cfg.target_fragment_coord = std::array<uint32_t, 2>{100u, 50u};
     auto result = RunAndValidate(cfg);
 
-    ASSERT_EQ(result.records.size(), 1u);
+    ASSERT_EQ(result.variables.size(), 1u);
 
     // Verify high-level structure: the IR should contain the atomic cursor,
     // the sample_index and match private vars, the if-gated record append,
@@ -260,7 +260,7 @@ TEST_F(IR_ShaderVariableInstrumentationTest,
     cfg.target_fragment_coord = std::array<uint32_t, 2>{0u, 0u};
     auto result = RunAndValidate(cfg);
 
-    ASSERT_EQ(result.records.size(), 1u);
+    ASSERT_EQ(result.variables.size(), 1u);
 
     // The existing `my_pos` parameter should be reused; a sample_index
     // parameter is added but no tint_frag_coord.
@@ -291,7 +291,7 @@ TEST_F(IR_ShaderVariableInstrumentationTest,
     cfg.target_fragment_coord = std::array<uint32_t, 2>{0u, 0u};
     auto result = RunAndValidate(cfg);
 
-    ASSERT_EQ(result.records.size(), 1u);
+    ASSERT_EQ(result.variables.size(), 1u);
 
     auto ir_text = str();
     // The private match var and sample_index var are created.
@@ -322,15 +322,36 @@ TEST_F(IR_ShaderVariableInstrumentationTest, TwoStores_SequentialIds) {
     cfg.buffer_binding_point = {1, 0};
     auto result = RunAndValidate(cfg);
 
-    ASSERT_EQ(result.records.size(), 2u);
-    EXPECT_EQ(result.records[0].variable_id, 0u);
-    EXPECT_EQ(result.records[0].data_type,
+    ASSERT_EQ(result.variables.size(), 2u);
+    EXPECT_EQ(result.variables[0].variable_id, 0u);
+    EXPECT_EQ(result.variables[0].data_type,
               ShaderVariableInstrumentationDataType::kU32);
-    EXPECT_EQ(result.records[0].variable_name, "a");
-    EXPECT_EQ(result.records[1].variable_id, 1u);
-    EXPECT_EQ(result.records[1].data_type,
+    EXPECT_EQ(result.variables[0].name, "a");
+    EXPECT_EQ(result.variables[1].variable_id, 1u);
+    EXPECT_EQ(result.variables[1].data_type,
               ShaderVariableInstrumentationDataType::kF32);
-    EXPECT_EQ(result.records[1].variable_name, "b");
+    EXPECT_EQ(result.variables[1].name, "b");
+}
+
+TEST_F(IR_ShaderVariableInstrumentationTest, TwoStoresToSameVar_ShareOneId) {
+    auto* func = b.Function("foo", ty.void_());
+    b.Append(func->Block(), [&] {
+        auto* v = b.Var<function, u32>("v");
+        b.Store(v, 1_u);
+        b.Store(v, 2_u);
+        b.Return(func);
+    });
+
+    ShaderVariableInstrumentationConfig cfg;
+    cfg.buffer_binding_point = {1, 0};
+    auto result = RunAndValidate(cfg);
+
+    // Both stores target the same Var, so only ONE variable entry is created.
+    ASSERT_EQ(result.variables.size(), 1u);
+    EXPECT_EQ(result.variables[0].variable_id, 0u);
+    EXPECT_EQ(result.variables[0].name, "v");
+    EXPECT_EQ(result.variables[0].data_type,
+              ShaderVariableInstrumentationDataType::kU32);
 }
 
 }  // namespace
