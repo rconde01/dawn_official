@@ -46,6 +46,7 @@
 #include "src/tint/lang/core/type/f32.h"
 #include "src/tint/lang/core/type/i32.h"
 #include "src/tint/lang/core/type/manager.h"
+#include "src/tint/lang/core/type/matrix.h"
 #include "src/tint/lang/core/type/pointer.h"
 #include "src/tint/lang/core/type/struct.h"
 #include "src/tint/lang/core/type/bool.h"
@@ -123,14 +124,37 @@ struct State {
         return nullptr;
     }
 
+    /// @returns true if a type is a supported scalar for instrumentation.
+    static bool IsSupportedScalar(const core::type::Type* t) {
+        return t->IsAnyOf<core::type::Bool, core::type::I32, core::type::U32,
+                          core::type::F32, core::type::F16, core::type::I8,
+                          core::type::U8, core::type::U16, core::type::U64>();
+    }
+
     /// @returns true if the given Store instruction should be instrumented.
     bool ShouldInstrument(Store* store) {
-        // Instrument stores of any scalar type. Vectors, matrices, arrays
-        // and structs are excluded.
         const auto* from_type = store->From()->Type();
-        if (!from_type->IsAnyOf<core::type::Bool, core::type::I32, core::type::U32,
-                                core::type::F32, core::type::F16, core::type::I8,
-                                core::type::U8, core::type::U16, core::type::U64>()) {
+
+        // Scalars.
+        if (IsSupportedScalar(from_type)) {
+            // fall through to variable checks below
+        } else if (auto* vec = from_type->As<core::type::Vector>()) {
+            // Vectors of supported element types.
+            if (!IsSupportedScalar(vec->Type())) {
+                return false;
+            }
+            // Only vec2/vec3/vec4 of i32/u32/f32/f16 are encoded; other
+            // element types (bool, i8, u8, u16, u64) have no vector tags.
+            if (!vec->Type()->IsAnyOf<core::type::I32, core::type::U32,
+                                      core::type::F32, core::type::F16>()) {
+                return false;
+            }
+        } else if (auto* mat = from_type->As<core::type::Matrix>()) {
+            // Only f32 matrices have tags.
+            if (!mat->Type()->Is<core::type::F32>()) {
+                return false;
+            }
+        } else {
             return false;
         }
 
@@ -171,19 +195,44 @@ struct State {
         }
     }
 
-    /// Map an IR type to the data-type tag stored in the packed header.
+    /// Map a scalar IR type to a data-type tag.
+    static ShaderVariableInstrumentationDataType ScalarDataType(const core::type::Type* t) {
+        using DT = ShaderVariableInstrumentationDataType;
+        if (t->Is<core::type::Bool>()) return DT::kBool;
+        if (t->Is<core::type::I32>()) return DT::kI32;
+        if (t->Is<core::type::U32>()) return DT::kU32;
+        if (t->Is<core::type::F32>()) return DT::kF32;
+        if (t->Is<core::type::F16>()) return DT::kF16;
+        if (t->Is<core::type::I8>()) return DT::kI8;
+        if (t->Is<core::type::U8>()) return DT::kU8;
+        if (t->Is<core::type::U16>()) return DT::kU16;
+        if (t->Is<core::type::U64>()) return DT::kU64;
+        return DT::kU32;  // fallback
+    }
+
+    /// Map any supported IR type to the data-type tag stored in the packed
+    /// header. Handles scalars, vectors, and matrices.
     ShaderVariableInstrumentationDataType DataTypeOf(const core::type::Type* type) {
         using DT = ShaderVariableInstrumentationDataType;
-        if (type->Is<core::type::Bool>()) return DT::kBool;
-        if (type->Is<core::type::I32>()) return DT::kI32;
-        if (type->Is<core::type::U32>()) return DT::kU32;
-        if (type->Is<core::type::F32>()) return DT::kF32;
-        if (type->Is<core::type::F16>()) return DT::kF16;
-        if (type->Is<core::type::I8>()) return DT::kI8;
-        if (type->Is<core::type::U8>()) return DT::kU8;
-        if (type->Is<core::type::U16>()) return DT::kU16;
-        if (type->Is<core::type::U64>()) return DT::kU64;
-        return DT::kU32;  // fallback
+
+        if (auto* vec = type->As<core::type::Vector>()) {
+            auto w = vec->Width();
+            auto* el = vec->Type();
+            // vec{2,3,4} × {i32, u32, f32, f16}
+            if (el->Is<core::type::I32>()) return static_cast<DT>(9 + (w - 2));   // 9,10,11
+            if (el->Is<core::type::U32>()) return static_cast<DT>(12 + (w - 2));  // 12,13,14
+            if (el->Is<core::type::F32>()) return static_cast<DT>(15 + (w - 2));  // 15,16,17
+            if (el->Is<core::type::F16>()) return static_cast<DT>(18 + (w - 2));  // 18,19,20
+        }
+
+        if (auto* mat = type->As<core::type::Matrix>()) {
+            // mat CxR f32, encoded as 21 + (C-2)*3 + (R-2)
+            auto c = mat->Columns();
+            auto r = mat->Rows();
+            return static_cast<DT>(21 + (c - 2) * 3 + (r - 2));
+        }
+
+        return ScalarDataType(type);
     }
 
     /// Find the destination variable name for a store, tracing through trivial
@@ -325,47 +374,73 @@ struct State {
                                           config.buffer_binding_point.binding);
     }
 
-    /// Convert a loaded scalar value to one or two u32 data words.
+    /// Convert a single scalar element to a u32 word.
+    /// @param elem the scalar value
+    /// @param elem_type the element's IR type
+    /// @returns a u32 Value
+    Value* ScalarElementToU32(Value* elem, const core::type::Type* elem_type) {
+        if (elem_type->Is<core::type::U32>()) {
+            return elem;
+        }
+        if (elem_type->IsAnyOf<core::type::I32, core::type::F32>()) {
+            return b.Bitcast(ty.u32(), elem)->Result();
+        }
+        if (elem_type->Is<core::type::Bool>()) {
+            return b.Call(ty.u32(), core::BuiltinFn::kSelect, 0_u, 1_u, elem)->Result();
+        }
+        if (elem_type->Is<core::type::F16>()) {
+            return b.Bitcast(ty.u32(), b.Convert(ty.f32(), elem))->Result();
+        }
+        if (elem_type->Is<core::type::I8>()) {
+            return b.Bitcast(ty.u32(), b.Convert(ty.i32(), elem))->Result();
+        }
+        if (elem_type->IsAnyOf<core::type::U8, core::type::U16>()) {
+            return b.Convert(ty.u32(), elem)->Result();
+        }
+        // u64 → 2 words; handled separately.
+        return elem;
+    }
+
+    /// Convert a loaded value of any instrumented type to u32 data words.
     /// @param loaded the loaded value
-    /// @param dt the data type tag
-    /// @param[out] words filled with 1 or 2 u32 Values
-    void ScalarToDataWords(Value* loaded, ShaderVariableInstrumentationDataType dt,
-                           Vector<Value*, 2>& words) {
-        using DT = ShaderVariableInstrumentationDataType;
-        switch (dt) {
-            case DT::kU32:
-                words.Push(loaded);
-                break;
-            case DT::kI32:
-            case DT::kF32:
-                // Same size, bitcast directly.
-                words.Push(b.Bitcast(ty.u32(), loaded)->Result());
-                break;
-            case DT::kBool:
-                // select(0u, 1u, bool)
-                words.Push(
-                    b.Call(ty.u32(), core::BuiltinFn::kSelect, 0_u, 1_u, loaded)->Result());
-                break;
-            case DT::kF16:
-                // f16 → f32 → bitcast<u32>
-                words.Push(b.Bitcast(ty.u32(), b.Convert(ty.f32(), loaded))->Result());
-                break;
-            case DT::kI8:
-                // i8 → i32 → bitcast<u32>
-                words.Push(b.Bitcast(ty.u32(), b.Convert(ty.i32(), loaded))->Result());
-                break;
-            case DT::kU8:
-            case DT::kU16:
-                // u8/u16 → u32
-                words.Push(b.Convert(ty.u32(), loaded)->Result());
-                break;
-            case DT::kU64: {
-                // u64 → bitcast<vec2<u32>>, then extract [0] (lo) and [1] (hi).
+    /// @param from_type the IR type of the loaded value
+    /// @param[out] words filled with data word Values
+    void ValueToDataWords(Value* loaded, const core::type::Type* from_type,
+                          Vector<Value*, 16>& words) {
+        // Scalar
+        if (IsSupportedScalar(from_type)) {
+            if (from_type->Is<core::type::U64>()) {
                 auto* pair = b.Bitcast(ty.vec2<u32>(), loaded)->Result();
                 words.Push(b.Access(ty.u32(), pair, 0_u)->Result());
                 words.Push(b.Access(ty.u32(), pair, 1_u)->Result());
-                break;
+            } else {
+                words.Push(ScalarElementToU32(loaded, from_type));
             }
+            return;
+        }
+
+        // Vector
+        if (auto* vec = from_type->As<core::type::Vector>()) {
+            auto* el_type = vec->Type();
+            for (uint32_t i = 0; i < vec->Width(); i++) {
+                auto* comp = b.Access(el_type, loaded, u32(i))->Result();
+                words.Push(ScalarElementToU32(comp, el_type));
+            }
+            return;
+        }
+
+        // Matrix — column-major: iterate columns, then rows.
+        if (auto* mat = from_type->As<core::type::Matrix>()) {
+            auto* el_type = mat->Type();  // scalar element type (f32)
+            auto* col_type = mat->ColumnType();
+            for (uint32_t c = 0; c < mat->Columns(); c++) {
+                auto* col = b.Access(col_type, loaded, u32(c))->Result();
+                for (uint32_t r = 0; r < mat->Rows(); r++) {
+                    auto* elem = b.Access(el_type, col, u32(r))->Result();
+                    words.Push(ScalarElementToU32(elem, el_type));
+                }
+            }
+            return;
         }
     }
 
@@ -373,7 +448,7 @@ struct State {
     /// builder's current insertion point.
     /// @param store the store being instrumented
     /// @param variable_id the 10-bit variable id
-    /// @param line the 14-bit source line number
+    /// @param line the 13-bit source line number
     /// @param dt the data type tag
     void EmitAppendRecord(Store* store,
                           uint32_t variable_id,
@@ -385,8 +460,8 @@ struct State {
         auto* loaded = b.Load(store->To())->Result();
 
         // Convert the loaded value to u32 data words.
-        Vector<Value*, 2> data_words;
-        ScalarToDataWords(loaded, dt, data_words);
+        Vector<Value*, 16> data_words;
+        ValueToDataWords(loaded, store->From()->Type(), data_words);
         const uint32_t num_data_words = static_cast<uint32_t>(data_words.Length());
 
         // Build the packed header:

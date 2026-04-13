@@ -54,29 +54,46 @@ const Capabilities kShaderVariableInstrumentationCapabilities{
     Capability::kAllow16BitIntegers,
 };
 
-/// The scalar type of a value that was captured by the instrumentation.
-/// The 4-bit tag is stored in the packed record id and determines how
-/// many u32 data words follow the header and how they should be
-/// re-interpreted by the host.
+/// The 5-bit data type tag stored in the packed record header. Determines
+/// how many u32 data words follow the header and how to re-interpret them.
 enum class ShaderVariableInstrumentationDataType : uint32_t {
-    kBool = 0,   // 1 data word: 0u or 1u
-    kI32 = 1,    // 1 data word: bitcast<u32>(i32)
-    kU32 = 2,    // 1 data word: u32
-    kF32 = 3,    // 1 data word: bitcast<u32>(f32)
-    kF16 = 4,    // 1 data word: bitcast<u32>(f32(f16))
-    kI8 = 5,     // 1 data word: u32(i32(i8))
-    kU8 = 6,     // 1 data word: u32(u8)
-    kU16 = 7,    // 1 data word: u32(u16)
-    kU64 = 8,    // 2 data words: lo = bitcast<vec2<u32>>(u64)[0],
-                 //               hi = bitcast<vec2<u32>>(u64)[1]
+    // Scalars — 1 data word each (except u64 → 2)
+    kBool = 0,   // select(0u, 1u, val)
+    kI32 = 1,    // bitcast<u32>(val)
+    kU32 = 2,    // val
+    kF32 = 3,    // bitcast<u32>(val)
+    kF16 = 4,    // bitcast<u32>(f32(val))
+    kI8 = 5,     // bitcast<u32>(i32(val))
+    kU8 = 6,     // u32(val)
+    kU16 = 7,    // u32(val)
+    kU64 = 8,    // bitcast<vec2<u32>>(val) → lo, hi — 2 words
+
+    // Vectors — N data words (one per component, converted like the scalar)
+    kVec2I32 = 9,   kVec3I32 = 10,  kVec4I32 = 11,
+    kVec2U32 = 12,  kVec3U32 = 13,  kVec4U32 = 14,
+    kVec2F32 = 15,  kVec3F32 = 16,  kVec4F32 = 17,
+    kVec2F16 = 18,  kVec3F16 = 19,  kVec4F16 = 20,
+
+    // Matrices (f32) — C*R data words, column-major, each bitcast<u32>
+    kMat2x2F32 = 21,  // 4 words
+    kMat2x3F32 = 22,  // 6 words
+    kMat2x4F32 = 23,  // 8 words
+    kMat3x2F32 = 24,  // 6 words
+    kMat3x3F32 = 25,  // 9 words
+    kMat3x4F32 = 26,  // 12 words
+    kMat4x2F32 = 27,  // 8 words
+    kMat4x3F32 = 28,  // 12 words
+    kMat4x4F32 = 29,  // 16 words
+
+    // 30–31 reserved
 };
 
 /// Configuration options for ShaderVariableInstrumentation.
 ///
-/// The transform instruments scalar store instructions (u32, i32, f32) whose
-/// destination points at a user variable (typically `function`, `private` or
-/// `workgroup` address-space variables) so that the WebGPU debugger can
-/// observe how variables change over the course of a shader invocation.
+/// The transform instruments store instructions to scalar, vector and matrix
+/// variables in `function`, `private` or `workgroup` address spaces so that
+/// the WebGPU debugger can observe how variables change over the course of a
+/// shader invocation.
 ///
 /// A new storage buffer is added to the module at @p buffer_binding_point. The
 /// buffer has the following logical layout:
@@ -95,13 +112,14 @@ enum class ShaderVariableInstrumentationDataType : uint32_t {
 /// The packed header is a u32 bitfield:
 ///
 ///   bits [0:9]   — 10 bits — variable id (0–1023)
-///   bits [10:23] — 14 bits — source line number (0–16383)
-///   bits [24:27] —  4 bits — data type (ShaderVariableInstrumentationDataType)
+///   bits [10:22] — 13 bits — source line number (0–8191)
+///   bits [23:27] —  5 bits — data type (ShaderVariableInstrumentationDataType)
 ///   bits [28:31] —  4 bits — @builtin(sample_index) (0–15)
 ///
 /// The data type tag determines how many data words follow the header
-/// (1 for all types except u64 which uses 2) and how to re-interpret
-/// them on the host.
+/// and how to re-interpret them on the host. Scalars produce 1 data
+/// word (except u64 → 2), vec{2,3,4} produce {2,3,4} words, and
+/// mat CxR produces C*R words (column-major).
 ///
 /// The variable id and line number are compile-time constants baked in by
 /// the transform. The sample index is a per-invocation runtime value read
@@ -152,27 +170,44 @@ struct ShaderVariableInstrumentationConfig {
 };
 
 /// Bit layout constants for the packed record header.
-/// `(sample_index << 28) | (type << 24) | (line << 10) | variable_id`
+/// `(sample_index << 28) | (type << 23) | (line << 10) | variable_id`
 struct ShaderVariableInstrumentationIdLayout {
     static constexpr uint32_t kVariableIdBits = 10;
-    static constexpr uint32_t kLineBits = 14;
-    static constexpr uint32_t kTypeBits = 4;
+    static constexpr uint32_t kLineBits = 13;
+    static constexpr uint32_t kTypeBits = 5;
     static constexpr uint32_t kSampleIndexBits = 4;
 
-    static constexpr uint32_t kVariableIdShift = 0;
+    static constexpr uint32_t kVariableIdShift = 0;                                // 0
     static constexpr uint32_t kLineShift = kVariableIdBits;                        // 10
-    static constexpr uint32_t kTypeShift = kLineShift + kLineBits;                 // 24
+    static constexpr uint32_t kTypeShift = kLineShift + kLineBits;                 // 23
     static constexpr uint32_t kSampleIndexShift = kTypeShift + kTypeBits;          // 28
 
     static constexpr uint32_t kVariableIdMask = (1u << kVariableIdBits) - 1u;      // 0x3FF
-    static constexpr uint32_t kLineMask = (1u << kLineBits) - 1u;                  // 0x3FFF
-    static constexpr uint32_t kTypeMask = (1u << kTypeBits) - 1u;                  // 0xF
+    static constexpr uint32_t kLineMask = (1u << kLineBits) - 1u;                  // 0x1FFF
+    static constexpr uint32_t kTypeMask = (1u << kTypeBits) - 1u;                  // 0x1F
     static constexpr uint32_t kSampleIndexMask = (1u << kSampleIndexBits) - 1u;    // 0xF
 
     /// @returns the number of u32 data words that follow the header for a
     /// given data type tag.
     static constexpr uint32_t DataWordCount(ShaderVariableInstrumentationDataType t) {
-        return t == ShaderVariableInstrumentationDataType::kU64 ? 2u : 1u;
+        using DT = ShaderVariableInstrumentationDataType;
+        switch (t) {
+            case DT::kBool: case DT::kI32: case DT::kU32: case DT::kF32:
+            case DT::kF16: case DT::kI8: case DT::kU8: case DT::kU16: return 1;
+            case DT::kU64: case DT::kVec2I32: case DT::kVec2U32:
+            case DT::kVec2F32: case DT::kVec2F16: return 2;
+            case DT::kVec3I32: case DT::kVec3U32: case DT::kVec3F32:
+            case DT::kVec3F16: return 3;
+            case DT::kVec4I32: case DT::kVec4U32: case DT::kVec4F32:
+            case DT::kVec4F16: return 4;
+            case DT::kMat2x2F32: return 4;
+            case DT::kMat2x3F32: case DT::kMat3x2F32: return 6;
+            case DT::kMat2x4F32: case DT::kMat4x2F32: return 8;
+            case DT::kMat3x3F32: return 9;
+            case DT::kMat3x4F32: case DT::kMat4x3F32: return 12;
+            case DT::kMat4x4F32: return 16;
+            default: return 1;
+        }
     }
 };
 

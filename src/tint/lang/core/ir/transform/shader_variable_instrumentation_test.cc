@@ -162,7 +162,7 @@ TEST_F(IR_ShaderVariableInstrumentationTest, I32Store_UsesBitcast) {
     EXPECT_EQ(result.records[0].variable_name, "v");
 }
 
-TEST_F(IR_ShaderVariableInstrumentationTest, VectorStore_NotInstrumented) {
+TEST_F(IR_ShaderVariableInstrumentationTest, Vec4F32Store_Instrumented) {
     auto* func = b.Function("foo", ty.void_());
     b.Append(func->Block(), [&] {
         auto* v = b.Var("v", ty.ptr<function>(ty.vec4<f32>()));
@@ -170,16 +170,21 @@ TEST_F(IR_ShaderVariableInstrumentationTest, VectorStore_NotInstrumented) {
         b.Return(func);
     });
 
-    // Capture the pre-run IR string for comparison.
-    auto before = str();
-
     ShaderVariableInstrumentationConfig cfg;
     cfg.buffer_binding_point = {1, 0};
     auto result = RunAndValidate(cfg);
 
-    // Non-scalar stores are not supported by v1; the IR should be unchanged.
-    EXPECT_EQ(before, str());
-    EXPECT_EQ(result.records.size(), 0u);
+    ASSERT_EQ(result.records.size(), 1u);
+    EXPECT_EQ(result.records[0].data_type,
+              ShaderVariableInstrumentationDataType::kVec4F32);
+    EXPECT_EQ(result.records[0].variable_name, "v");
+
+    // vec4<f32> produces 4 data words; cursor should advance by 5
+    // (1 header + 4 data words).
+    auto ir_text = str();
+    EXPECT_NE(ir_text.find("atomicAdd"), std::string::npos);
+    // The atomicAdd should reserve 5 entries (1 header + 4 words).
+    EXPECT_NE(ir_text.find("5u"), std::string::npos);
 }
 
 TEST_F(IR_ShaderVariableInstrumentationTest, BoolStore_UsesSelect) {
