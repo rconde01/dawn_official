@@ -333,6 +333,102 @@ TEST_F(IR_ShaderVariableInstrumentationTest, TwoStores_SequentialIds) {
     EXPECT_EQ(result.variables[1].name, "b");
 }
 
+TEST_F(IR_ShaderVariableInstrumentationTest, LineMarkers_Disabled_NoMarkerInstructions) {
+    // Default: emit_line_markers = false. A UserCall should not produce
+    // any marker records.
+    auto* callee = b.Function("callee", ty.u32());
+    b.Append(callee->Block(), [&] { b.Return(callee, 7_u); });
+
+    auto* func = b.Function("foo", ty.void_());
+    ir::UserCall* call = nullptr;
+    b.Append(func->Block(), [&] {
+        auto* v = b.Var<function, u32>("v");
+        b.Store(v, 1_u);
+        call = b.Call(ty.u32(), callee);
+        b.Return(func);
+    });
+    mod.SetSource(call, Source{{5, 1}});
+
+    ShaderVariableInstrumentationConfig cfg;
+    cfg.buffer_binding_point = {1, 0};
+    // Leave emit_line_markers at default (false).
+    auto result = RunAndValidate(cfg);
+
+    ASSERT_EQ(result.variables.size(), 1u);  // Just `v`.
+    // Exactly one atomicAdd: the store record. No marker for the call.
+    auto ir_text = str();
+    size_t count = 0;
+    size_t pos = 0;
+    while ((pos = ir_text.find("atomicAdd", pos)) != std::string::npos) {
+        ++count;
+        pos += 9;
+    }
+    EXPECT_EQ(count, 1u) << "Expected only the store's atomicAdd, no marker";
+}
+
+TEST_F(IR_ShaderVariableInstrumentationTest, LineMarkers_Enabled_EmitsMarkerForCall) {
+    // Use a non-void UserCall so the call instruction has a single-result
+    // Value that can carry source info (Tint only tracks sources for
+    // single-result instructions).
+    auto* callee = b.Function("callee", ty.u32());
+    b.Append(callee->Block(), [&] { b.Return(callee, 7_u); });
+
+    auto* func = b.Function("foo", ty.u32());
+    ir::UserCall* call = nullptr;
+    b.Append(func->Block(), [&] {
+        call = b.Call(ty.u32(), callee);
+        b.Return(func, call);
+    });
+    mod.SetSource(call, Source{{5, 1}});
+
+    ShaderVariableInstrumentationConfig cfg;
+    cfg.buffer_binding_point = {1, 0};
+    cfg.emit_line_markers = true;
+    auto result = RunAndValidate(cfg);
+
+    // No variables recorded — the call isn't a store.
+    EXPECT_EQ(result.variables.size(), 0u);
+
+    // But the debug buffer is created and there is at least one atomicAdd,
+    // produced by the marker emitted before the UserCall.
+    auto ir_text = str();
+    EXPECT_NE(ir_text.find("tint_shader_debug_buffer"), std::string::npos);
+    EXPECT_NE(ir_text.find("atomicAdd"), std::string::npos);
+}
+
+TEST_F(IR_ShaderVariableInstrumentationTest, LineMarkers_Enabled_MarkerAndStoreBothEmit) {
+    // A store to a scalar plus a call with source info.
+    auto* callee = b.Function("callee", ty.u32());
+    b.Append(callee->Block(), [&] { b.Return(callee, 7_u); });
+
+    auto* func = b.Function("foo", ty.void_());
+    ir::UserCall* call = nullptr;
+    b.Append(func->Block(), [&] {
+        auto* v = b.Var<function, u32>("v");
+        b.Store(v, 1_u);
+        call = b.Call(ty.u32(), callee);
+        b.Return(func);
+    });
+    mod.SetSource(call, Source{{5, 1}});
+
+    ShaderVariableInstrumentationConfig cfg;
+    cfg.buffer_binding_point = {1, 0};
+    cfg.emit_line_markers = true;
+    auto result = RunAndValidate(cfg);
+
+    // One variable (v) and at least two atomicAdd sites (v's store record
+    // plus the call's line marker).
+    ASSERT_EQ(result.variables.size(), 1u);
+    auto ir_text = str();
+    size_t count = 0;
+    size_t pos = 0;
+    while ((pos = ir_text.find("atomicAdd", pos)) != std::string::npos) {
+        ++count;
+        pos += 9;
+    }
+    EXPECT_GE(count, 2u) << "Expected at least 2 atomicAdd sites (store + call marker)";
+}
+
 TEST_F(IR_ShaderVariableInstrumentationTest, TwoStoresToSameVar_ShareOneId) {
     auto* func = b.Function("foo", ty.void_());
     b.Append(func->Block(), [&] {

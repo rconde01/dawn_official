@@ -85,7 +85,13 @@ enum class ShaderVariableInstrumentationDataType : uint32_t {
     kMat4x3F32 = 28,  // 12 words
     kMat4x4F32 = 29,  // 16 words
 
-    // 30–31 reserved
+    /// Control-flow visit marker — 0 data words. Indicates execution passed
+    /// through the source line encoded in the header, without storing to an
+    /// instrumented variable. Emitted for `If`, `Loop`, `Switch`, `UserCall`
+    /// and `Return` instructions when `emit_line_markers` is enabled.
+    kLineMarker = 30,
+
+    // 31 reserved
 };
 
 /// Configuration options for ShaderVariableInstrumentation.
@@ -118,8 +124,9 @@ enum class ShaderVariableInstrumentationDataType : uint32_t {
 ///
 /// The data type tag determines how many data words follow the header
 /// and how to re-interpret them on the host. Scalars produce 1 data
-/// word (except u64 → 2), vec{2,3,4} produce {2,3,4} words, and
-/// mat CxR produces C*R words (column-major).
+/// word (except u64 → 2), vec{2,3,4} produce {2,3,4} words, mat CxR
+/// produces C*R words (column-major), and `kLineMarker` produces 0
+/// data words (header only).
 ///
 /// The variable id and line number are compile-time constants baked in by
 /// the transform. The sample index is a per-invocation runtime value read
@@ -167,6 +174,24 @@ struct ShaderVariableInstrumentationConfig {
     /// that passes the gate; the sample index in the packed id distinguishes
     /// them.
     std::optional<std::array<uint32_t, 2>> target_fragment_coord{};
+
+    /// If true, emit line-marker records (`kLineMarker`) before every
+    /// `If`, `Loop`, `Switch`, `UserCall` and `Return` IR instruction that
+    /// has source info attached. Markers have no data words — they just
+    /// encode the source line — and let the debugger see the order in
+    /// which non-store lines executed, which is essential for stepping
+    /// through control flow.
+    ///
+    /// Note: Tint's IR only tracks source info for single-result
+    /// instructions (vars, lets, calls, etc.). In practice this means
+    /// `UserCall`s produce markers reliably, but `If`/`Loop`/`Switch`/
+    /// `Return` will only produce markers if some upstream pass has
+    /// attached source info to them. Instructions whose `ir.SourceOf()`
+    /// returns a line of 0 are silently skipped.
+    ///
+    /// Like regular records, markers are gated by `target_fragment_coord`
+    /// when that filter is enabled.
+    bool emit_line_markers = false;
 };
 
 /// Bit layout constants for the packed record header.
@@ -192,6 +217,7 @@ struct ShaderVariableInstrumentationIdLayout {
     static constexpr uint32_t DataWordCount(ShaderVariableInstrumentationDataType t) {
         using DT = ShaderVariableInstrumentationDataType;
         switch (t) {
+            case DT::kLineMarker: return 0;
             case DT::kBool: case DT::kI32: case DT::kU32: case DT::kF32:
             case DT::kF16: case DT::kI8: case DT::kU8: case DT::kU16: return 1;
             case DT::kU64: case DT::kVec2I32: case DT::kVec2U32:

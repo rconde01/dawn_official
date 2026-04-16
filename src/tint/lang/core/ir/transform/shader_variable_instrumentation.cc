@@ -37,8 +37,12 @@
 #include "src/tint/lang/core/ir/if.h"
 #include "src/tint/lang/core/ir/instruction_result.h"
 #include "src/tint/lang/core/ir/let.h"
+#include "src/tint/lang/core/ir/loop.h"
 #include "src/tint/lang/core/ir/module.h"
+#include "src/tint/lang/core/ir/return.h"
 #include "src/tint/lang/core/ir/store.h"
+#include "src/tint/lang/core/ir/switch.h"
+#include "src/tint/lang/core/ir/user_call.h"
 #include "src/tint/lang/core/ir/validator.h"
 #include "src/tint/lang/core/ir/var.h"
 #include "src/tint/lang/core/number.h"
@@ -488,6 +492,56 @@ struct State {
         }
     }
 
+    /// Emit a zero-data-word line-marker record into the builder's current
+    /// insertion point. Header encodes type=kLineMarker, line=<line>.
+    /// @param line the 13-bit source line number
+    void EmitLineMarkerRecord(uint32_t line) {
+        using L = ShaderVariableInstrumentationIdLayout;
+        using DT = ShaderVariableInstrumentationDataType;
+
+        const uint32_t static_bits =
+            (static_cast<uint32_t>(DT::kLineMarker) << L::kTypeShift) |
+            ((line & L::kLineMask) << L::kLineShift);
+        auto* si = b.Load(sample_index_var)->Result();
+        auto* si_masked = b.And(si, u32(L::kSampleIndexMask))->Result();
+        auto* si_shifted = b.ShiftLeft(si_masked, u32(L::kSampleIndexShift))->Result();
+        auto* packed_header = b.Or(si_shifted, u32(static_bits))->Result();
+
+        // Reserve exactly 1 entry (header only).
+        auto* cursor_ptr = b.Access(
+            ty.ptr(core::AddressSpace::kStorage, ty.atomic<u32>(), core::Access::kReadWrite),
+            debug_buffer_var, u32(kCursorMemberIndex));
+        auto* slot =
+            b.Call(ty.u32(), core::BuiltinFn::kAtomicAdd, cursor_ptr, 1_u)->Result();
+
+        auto* hdr_ptr = b.Access(
+            ty.ptr(core::AddressSpace::kStorage, ty.u32(), core::Access::kReadWrite),
+            debug_buffer_var, u32(kRecordsMemberIndex), slot);
+        b.Store(hdr_ptr, packed_header);
+    }
+
+    /// Emit a line marker before @p inst, optionally gated by the match flag.
+    void EmitLineMarkerBefore(Instruction* inst, uint32_t line) {
+        b.InsertBefore(inst, [&] {
+            if (match_var == nullptr) {
+                EmitLineMarkerRecord(line);
+                return;
+            }
+            auto* cond = b.Load(match_var)->Result();
+            auto* ifelse = b.If(cond);
+            b.Append(ifelse->True(), [&] {
+                EmitLineMarkerRecord(line);
+                b.ExitIf(ifelse);
+            });
+        });
+    }
+
+    /// @returns true if the given instruction is a control-flow instruction
+    /// that should get a line marker emitted before it.
+    static bool IsMarkerTarget(Instruction* inst) {
+        return inst->IsAnyOf<If, Loop, Switch, UserCall, Return>();
+    }
+
     /// Emit the instrumentation sequence for a single store, optionally gated
     /// by the per-invocation match flag.
     /// @param store the store being instrumented
@@ -513,19 +567,25 @@ struct State {
 
     /// Run the transform.
     ShaderVariableInstrumentationResult Run() {
-        // First pass: collect all candidate stores before mutating the module.
-        // This avoids instrumenting stores we insert ourselves and keeps the
-        // instruction-iterator stable while we mutate.
+        using L = ShaderVariableInstrumentationIdLayout;
+
+        // First pass: collect all candidate stores — and, if line markers
+        // are enabled, all candidate control-flow instructions — before
+        // mutating the module. This avoids instrumenting instructions we
+        // insert ourselves and keeps the iterator stable while we mutate.
         std::vector<Store*> candidates;
+        std::vector<Instruction*> marker_candidates;
         for (auto* inst : ir.Instructions()) {
             if (auto* store = inst->As<Store>()) {
                 if (ShouldInstrument(store)) {
                     candidates.push_back(store);
                 }
+            } else if (config.emit_line_markers && IsMarkerTarget(inst)) {
+                marker_candidates.push_back(inst);
             }
         }
 
-        if (candidates.empty()) {
+        if (candidates.empty() && marker_candidates.empty()) {
             return {};
         }
 
@@ -542,7 +602,6 @@ struct State {
         // Second pass: instrument each candidate. Variable ids are assigned
         // per unique Var (not per store), so multiple stores to the same
         // variable share one id.
-        using L = ShaderVariableInstrumentationIdLayout;
         for (auto* store : candidates) {
             auto* var = OriginatingVar(store->To());
             TINT_IR_ASSERT(ir, var != nullptr);
@@ -583,6 +642,20 @@ struct State {
 
             auto dt = DataTypeOf(store->From()->Type());
             EmitInstrumentation(store, variable_id, store_line, dt);
+        }
+
+        // Third pass: emit a line-marker record before each collected
+        // control-flow instruction. Instructions with no source info are
+        // skipped so we don't flood the buffer with line=0 markers.
+        for (auto* inst : marker_candidates) {
+            auto src = ir.SourceOf(inst);
+            if (src.range.begin.line == 0) {
+                continue;
+            }
+            const uint32_t line = src.range.begin.line <= L::kLineMask
+                                      ? static_cast<uint32_t>(src.range.begin.line)
+                                      : L::kLineMask;
+            EmitLineMarkerBefore(inst, line);
         }
 
         ShaderVariableInstrumentationResult result;
