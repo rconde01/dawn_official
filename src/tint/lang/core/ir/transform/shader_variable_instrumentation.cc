@@ -520,6 +520,42 @@ struct State {
         b.Store(hdr_ptr, packed_header);
     }
 
+    /// Try to determine a source line for an instruction. Falls back to the
+    /// instruction's first operand (the condition for If/Switch, the return
+    /// value for Return) when the instruction itself has no source info.
+    /// @returns 0 if no source line could be determined.
+    uint32_t InferSourceLine(Instruction* inst) {
+        using L = ShaderVariableInstrumentationIdLayout;
+
+        auto src = ir.SourceOf(inst);
+        if (src.range.begin.line != 0) {
+            return src.range.begin.line <= L::kLineMask
+                       ? static_cast<uint32_t>(src.range.begin.line)
+                       : L::kLineMask;
+        }
+
+        // Fall back to the source of a key operand.
+        Value* fallback = nullptr;
+        if (auto* if_inst = inst->As<If>()) {
+            fallback = if_inst->Condition();
+        } else if (auto* sw = inst->As<Switch>()) {
+            fallback = sw->Condition();
+        } else if (auto* ret = inst->As<Return>()) {
+            fallback = ret->Value();
+        }
+
+        if (fallback) {
+            auto fb_src = ir.SourceOf(fallback);
+            if (fb_src.range.begin.line != 0) {
+                return fb_src.range.begin.line <= L::kLineMask
+                           ? static_cast<uint32_t>(fb_src.range.begin.line)
+                           : L::kLineMask;
+            }
+        }
+
+        return 0;
+    }
+
     /// Emit a line marker before @p inst, optionally gated by the match flag.
     void EmitLineMarkerBefore(Instruction* inst, uint32_t line) {
         b.InsertBefore(inst, [&] {
@@ -645,16 +681,12 @@ struct State {
         }
 
         // Third pass: emit a line-marker record before each collected
-        // control-flow instruction. Instructions with no source info are
-        // skipped so we don't flood the buffer with line=0 markers.
+        // control-flow instruction.
         for (auto* inst : marker_candidates) {
-            auto src = ir.SourceOf(inst);
-            if (src.range.begin.line == 0) {
+            const uint32_t line = InferSourceLine(inst);
+            if (line == 0) {
                 continue;
             }
-            const uint32_t line = src.range.begin.line <= L::kLineMask
-                                      ? static_cast<uint32_t>(src.range.begin.line)
-                                      : L::kLineMask;
             EmitLineMarkerBefore(inst, line);
         }
 
