@@ -429,28 +429,29 @@ TEST_F(IR_ShaderVariableInstrumentationTest, LineMarkers_Enabled_MarkerAndStoreB
     EXPECT_GE(count, 2u) << "Expected at least 2 atomicAdd sites (store + call marker)";
 }
 
-TEST_F(IR_ShaderVariableInstrumentationTest, LineMarkers_InfersLineFromIfCondition) {
-    // The If instruction itself has no source, but its condition does.
-    // The transform should infer the line from the condition value.
+TEST_F(IR_ShaderVariableInstrumentationTest, LineMarkers_EmitsMarkerForIfAndReturn) {
+    // Now that ir::Module supports SetSource for non-single-result
+    // instructions, If and Return can carry source info directly.
     auto* func = b.Function("foo", ty.void_());
+    ir::If* ifelse = nullptr;
+    ir::Return* ret = nullptr;
     b.Append(func->Block(), [&] {
         auto* v = b.Var<function, bool>("v");
         b.Store(v, true);
         auto* loaded = b.Load(v);
-        mod.SetSource(loaded, Source{{10, 1}});
-        auto* ifelse = b.If(loaded);
-        // If instruction has no source (0 results = no SetSource possible).
+        ifelse = b.If(loaded);
         b.Append(ifelse->True(), [&] { b.ExitIf(ifelse); });
-        b.Return(func);
+        ret = b.Return(func);
     });
+    mod.SetSource(ifelse, Source{{10, 1}});
+    mod.SetSource(ret, Source{{12, 1}});
 
     ShaderVariableInstrumentationConfig cfg;
     cfg.buffer_binding_point = {1, 0};
     cfg.emit_line_markers = true;
     auto result = RunAndValidate(cfg);
 
-    // At least 2 atomicAdd sites: the bool store + the If marker (from
-    // the condition's inferred source line).
+    // At least 3 atomicAdd sites: bool store + If marker + Return marker.
     auto ir_text = str();
     size_t count = 0;
     size_t pos = 0;
@@ -458,7 +459,7 @@ TEST_F(IR_ShaderVariableInstrumentationTest, LineMarkers_InfersLineFromIfConditi
         ++count;
         pos += 9;
     }
-    EXPECT_GE(count, 2u) << "Expected at least 2 atomicAdd (store + If marker)";
+    EXPECT_GE(count, 3u) << "Expected at least 3 atomicAdd (store + If + Return markers)";
 }
 
 TEST_F(IR_ShaderVariableInstrumentationTest, TwoStoresToSameVar_ShareOneId) {

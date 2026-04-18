@@ -176,18 +176,16 @@ struct ShaderVariableInstrumentationConfig {
     std::optional<std::array<uint32_t, 2>> target_fragment_coord{};
 
     /// If true, emit line-marker records (`kLineMarker`) before every
-    /// `If`, `Loop`, `Switch`, `UserCall` and `Return` IR instruction that
-    /// has source info attached. Markers have no data words — they just
-    /// encode the source line — and let the debugger see the order in
-    /// which non-store lines executed, which is essential for stepping
+    /// `If`, `Loop`, `Switch`, `UserCall` and `Return` IR instruction
+    /// that has source info attached.  Markers have no data words — they
+    /// just encode the source line — and let the debugger see the order
+    /// in which non-store lines executed, which is essential for stepping
     /// through control flow.
     ///
-    /// Note: Tint's IR only tracks source info for single-result
-    /// instructions (vars, lets, calls, etc.). In practice this means
-    /// `UserCall`s produce markers reliably, but `If`/`Loop`/`Switch`/
-    /// `Return` will only produce markers if some upstream pass has
-    /// attached source info to them. Instructions whose `ir.SourceOf()`
-    /// returns a line of 0 are silently skipped.
+    /// The WGSL reader attaches source info to all of these instruction
+    /// types, so markers cover branches, loops, calls and returns when
+    /// the IR was produced from WGSL. Instructions whose
+    /// `ir.SourceOf()` returns a line of 0 are silently skipped.
     ///
     /// Like regular records, markers are gated by `target_fragment_coord`
     /// when that filter is enabled.

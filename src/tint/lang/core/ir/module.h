@@ -59,6 +59,11 @@ class Module {
     // The source information for a value
     Hashmap<const Value*, Source, 32> value_to_source_;
 
+    // Source information for instructions that have no single result (e.g.
+    // If, Loop, Switch, Return). Single-result instructions use the
+    // value_to_source_ map via their Result() instead.
+    Hashmap<const Instruction*, Source, 16> inst_to_source_;
+
     /// A predicate function that returns true if the instruction or value is alive.
     struct IsAlive {
         bool operator()(const Instruction* instruction) const { return instruction->Alive(); }
@@ -131,7 +136,6 @@ class Module {
 
     /// @param inst the instruction to set the source of
     /// @param src the source
-    /// @note requires the instruction be a single result instruction.
     void SetSource(Instruction* inst, Source src);
 
     /// @param value the value to set the source
@@ -140,7 +144,7 @@ class Module {
 
     /// @param inst the instruction
     /// @return the source of the given instruction, or an empty source if the instruction does not
-    /// have a source or does not have a single return value.
+    /// have a source.
     Source SourceOf(const Instruction* inst) const;
 
     /// @param value the value

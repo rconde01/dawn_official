@@ -159,8 +159,11 @@ void Module::ClearName(Value* value) {
 }
 
 void Module::SetSource(Instruction* inst, Source src) {
-    TINT_ASSERT(inst->Results().Length() == 1);
-    SetSource(inst->Result(), src);
+    if (inst->Results().Length() == 1) {
+        SetSource(inst->Result(), src);
+    } else {
+        inst_to_source_.Replace(inst, src);
+    }
 }
 
 void Module::SetSource(Value* value, Source src) {
@@ -168,10 +171,10 @@ void Module::SetSource(Value* value, Source src) {
 }
 
 Source Module::SourceOf(const Instruction* inst) const {
-    if (inst->Results().Length() != 1) {
-        return Source{};
+    if (inst->Results().Length() == 1) {
+        return SourceOf(inst->Result());
     }
-    return SourceOf(inst->Result());
+    return inst_to_source_.GetOr(inst, Source{});
 }
 
 Source Module::SourceOf(const Value* value) const {

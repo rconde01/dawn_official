@@ -639,6 +639,7 @@ class Impl {
             return;
         }
         auto* if_inst = builder_.If(reg);
+        builder_.ir.SetSource(if_inst, stmt->source);
         current_block_->Append(if_inst);
 
         {
@@ -668,6 +669,7 @@ class Impl {
 
     void EmitLoop(const ast::LoopStatement* stmt) {
         auto* loop_inst = builder_.Loop();
+        builder_.ir.SetSource(loop_inst, stmt->source);
         current_block_->Append(loop_inst);
 
         // Note: The loop doesn't use EmitBlock because it needs the scope stack to not get popped
@@ -709,6 +711,7 @@ class Impl {
 
     void EmitWhile(const ast::WhileStatement* stmt) {
         auto* loop_inst = builder_.Loop();
+        builder_.ir.SetSource(loop_inst, stmt->source);
         current_block_->Append(loop_inst);
 
         ControlStackScope scope(this, loop_inst);
@@ -753,6 +756,7 @@ class Impl {
 
     void EmitForLoop(const ast::ForLoopStatement* stmt) {
         auto* loop_inst = builder_.Loop();
+        builder_.ir.SetSource(loop_inst, stmt->source);
         current_block_->Append(loop_inst);
 
         ControlStackScope scope(this, loop_inst);
@@ -811,6 +815,7 @@ class Impl {
             return;
         }
         auto* switch_inst = builder_.Switch(reg);
+        builder_.ir.SetSource(switch_inst, stmt->source);
         current_block_->Append(switch_inst);
 
         ControlStackScope scope(this, switch_inst);
@@ -844,11 +849,14 @@ class Impl {
             }
             ret_value = ret;
         }
+        ir::Return* ret_inst = nullptr;
         if (ret_value) {
-            SetTerminator(builder_.Return(current_function_, ret_value));
+            ret_inst = builder_.Return(current_function_, ret_value);
         } else {
-            SetTerminator(builder_.Return(current_function_));
+            ret_inst = builder_.Return(current_function_);
         }
+        builder_.ir.SetSource(ret_inst, stmt->source);
+        SetTerminator(ret_inst);
     }
 
     void EmitBreak(const ast::BreakStatement*) {
